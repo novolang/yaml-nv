@@ -1,6 +1,6 @@
 [package]
 name        = "yaml-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The safe subset of YAML 1.2, read and written without performing anything: block and flow collections, the core schema's scalar resolution, anchors and aliases behind a budget that stops a billion-laughs document, multi-document streams, and an explicit refusal of the tags a safe loader must never honour.  A feed-and-drain reader over chunks, and a writer that emits block style under a named line-width policy."
 license     = "Apache-2.0"
 
@@ -24,6 +24,7 @@ category    = "data"
 tags        = ["yaml", "yaml-1.2", "safe-load", "config", "parser", "sans-io", "data"]
 repository  = "https://github.com/novolang/yaml-nv"
 maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
