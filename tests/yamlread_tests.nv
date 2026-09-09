@@ -1,0 +1,329 @@
+// yamlread_tests.nv — the API suite for the reader and the writer.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// yaml-nv.<module>.<fn>`.  What is asserted is the feed-and-drain
+// contract, the position on every refusal, the safety refusals in
+// action, and the writer's round-trip law.
+//
+// The helpers below unwrap a fixture that is known good, once each, so
+// the cases read as the assertions they are.  A case whose SUBJECT is
+// a refusal always matches the `Result` in full — that is the
+// assertion, and a helper would swallow it.
+
+use std.test
+use yamlnode
+use yamlerror
+use yamlsafe
+use yamlkeys
+use yamlread
+use yamlwrite
+
+// A document that is known to parse under the standard policy.
+fn parsed(src: Str) -> YamlValue
+    match yamlread.parse(src, yamlsafe.standard())
+        Ok(v)  => v
+        Err(_) => YamlNull
+
+// The kind name at a path, for the cases that assert what a scalar
+// resolved to.
+fn kind_at(doc: YamlValue, path: Str) -> Str
+    match yamlkeys.get(doc, path)
+        Ok(v)  => yamlnode.kind_name(v)
+        Err(_) => "missing"
+
+// A document rendered by the writer.
+fn rendered(doc: YamlValue) -> Str
+    match yamlwrite.to_string(doc, yamlwrite.standard())
+        Ok(s)  => s
+        Err(_) => "«unemittable»"
+
+// The classic YAML denial of service, four lines long.  Each anchor
+// is expanded nine times by the one below it, so the document grows
+// by 9^n and reaches a terabyte in twenty lines.
+fn billion_laughs() -> Str
+    list.join([
+        "a: &a [\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\"]",
+        "b: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]",
+        "c: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]",
+        "d: [*c,*c,*c,*c,*c,*c,*c,*c,*c]",
+        ""],
+        "\n")
+
+@test
+fn test_feed_hands_back_documents_as_the_stream_completes_them() [io]
+    // THE REASON THIS PACKAGE HAS A FEED-AND-DRAIN READER AND
+    // toml-nv DOES NOT: a YAML stream is a sequence of documents and
+    // each is complete at its terminator, so a chunk CAN complete one
+    // while the rest of the stream is still arriving.
+    test.case("a chunk completing one document yields one")
+    let r = yamlread.reader(yamlsafe.standard())
+    let (r2, first) = yamlread.feed_str(r, "a: 1\n---\n")
+    test.assert(list.len(first) == 1)
+
+    test.case("the unterminated remainder is carried into the next feed")
+    let (r3, second) = yamlread.feed_str(r2, "b: 2\n")
+    test.assert(list.len(second) == 0)
+
+    test.case("and finish yields it, because a final document needs no marker")
+    match yamlread.finish(r3)
+        Ok(rest) => test.assert(list.len(rest) == 1)
+        Err(_)   => test.fail("`b: 2` is a complete final document")
+
+    test.case("an empty chunk completes nothing and is not end of stream")
+    let e = yamlread.reader(yamlsafe.standard())
+    let (_, none) = yamlread.feed_str(e, "")
+    test.assert(list.len(none) == 0)
+
+@test
+fn test_a_chunk_may_split_anything() [io]
+    test.case("a `---` split between the second and third dash")
+    let r = yamlread.reader(yamlsafe.standard())
+    let (r2, _) = yamlread.feed_str(r, "a: 1\n--")
+    let (r3, docs) = yamlread.feed_str(r2, "-\nb: 2\n")
+    test.assert(list.len(docs) == 1)
+
+    test.case("and the stream still finishes with the second document")
+    match yamlread.finish(r3)
+        Ok(rest) => test.assert(list.len(rest) == 1)
+        Err(_)   => test.fail("the split marker still separated two documents")
+
+@test
+fn test_a_failed_reader_stays_failed() [io]
+    // YAML's parser state IS the indentation, and after a mistake that
+    // state is exactly what is wrong — so resynchronising at the next
+    // `---` would emit documents that are not in the file.
+    test.case("a tab in the indentation fails the reader")
+    let r = yamlread.reader(yamlsafe.standard())
+    let (r2, _) = yamlread.feed_str(r, "a:\n\tb: 1\n")
+    match yamlread.error(r2)
+        Some(TabInIndent(l, _)) => test.assert(l == 2)
+        Some(_)                 => test.fail("wrong reason for a tab")
+        None                    => test.fail("a tab in the indentation is a refusal")
+
+    test.case("and every subsequent feed yields nothing")
+    let (_, after) = yamlread.feed_str(r2, "---\nc: 3\n")
+    test.assert(list.len(after) == 0)
+
+@test
+fn test_every_refusal_carries_a_line_and_a_column() [io]
+    // YAML is whitespace-significant, so the mistakes people make in
+    // it are mistakes of COLUMN.  "mapping values are not allowed
+    // here" without a position is the message every YAML user has seen
+    // and none has been helped by.
+    test.case("a tab where a space is required gets its own arm")
+    match yamlread.parse("a:\n\tb: 1\n", yamlsafe.standard())
+        Err(TabInIndent(l, c)) =>
+            test.assert(l == 2)
+            test.assert(c == 1)
+        Err(_)                 => test.fail("a tab is not an ordinary indentation mistake")
+        Ok(_)                  => test.fail("YAML forbids a tab in the indentation")
+
+    test.case("a misindented key names the column it wanted")
+    match yamlread.parse("a:\n  b: 1\n   c: 2\n", yamlsafe.standard())
+        Err(BadIndent(l, c, want)) =>
+            test.assert(l == 3)
+            test.assert(c == 4)
+            test.assert(want == 3)
+        Err(_)                     => test.fail("wrong reason for a misindented key")
+        Ok(_)                      => test.fail("`c` is indented past its siblings")
+
+    test.case("an unclosed flow collection points at the OPENING bracket")
+    match yamlread.parse("a: [1, 2\n", yamlsafe.standard())
+        Err(UnterminatedFlow(l, c)) =>
+            test.assert(l == 1)
+            test.assert(c == 4)
+        Err(_)                      => test.fail("wrong reason for an unclosed flow sequence")
+        Ok(_)                       => test.fail("`[1, 2` is not closed")
+
+    test.case("a duplicate key is a refusal, not a last-one-wins")
+    match yamlread.parse("port: 1\nport: 2\n", yamlsafe.standard())
+        Err(DuplicateKey(l, _, k, first)) =>
+            test.assert(l == 2)
+            test.assert(k == "port")
+            test.assert(first == 1)
+        Err(_)                            => test.fail("wrong reason for a duplicate key")
+        Ok(_)                             => test.fail("a config file with `port` twice has a bug in it")
+
+@test
+fn test_the_unsafe_tag_is_refused_rather_than_ignored() [io]
+    // A loader that quietly ignored `!!python/object/apply` would
+    // leave a caller believing its input had been checked.
+    test.case("a language-specific tag is UnsafeTag, quoting the tag")
+    match yamlread.parse("a: !!python/object/apply:os.system ['ls']\n",
+                         yamlsafe.standard())
+        Err(UnsafeTag(_, _, t)) => test.assert(str.contains(t, "python/object"))
+        Err(_)                  => test.fail("wrong reason for a dangerous tag")
+        Ok(_)                   => test.fail("a safe loader refuses this outright")
+
+    test.case("and an application tag nobody allowed is the same refusal")
+    match yamlread.parse("Bucket: !Ref MyBucket\n", yamlsafe.standard())
+        Err(UnsafeTag(_, _, t)) => test.assert(t == "!Ref")
+        Err(_)                  => test.fail("wrong reason for an unallowed tag")
+        Ok(_)                   => test.fail("`!Ref` is not in the core schema")
+
+    test.case("until the caller names it, at a call site a reviewer can see")
+    let p = yamlsafe.allowing(yamlsafe.standard(), ["!Ref"])
+    match yamlread.parse("Bucket: !Ref MyBucket\n", p)
+        Ok(doc) => test.assert(yamlkeys.str_at(doc, "Bucket")! == "MyBucket")
+        Err(_)  => test.fail("`!Ref` was allowed by name")
+
+@test
+fn test_the_billion_laughs_document_is_refused_by_counting() [io]
+    // The classic YAML denial of service: aliases are references and
+    // expanding one copies, so nine per line reaches a terabyte in
+    // twenty lines.
+    let bomb = billion_laughs()
+
+    test.case("a tight node budget stops it, and the refusal carries the budget")
+    let tight = yamlsafe.with_max_nodes(yamlsafe.standard(), 100)
+    match yamlread.parse(bomb, tight)
+        Err(AliasBudgetExceeded(_, _, limit)) => test.assert(limit == 100)
+        Err(_)                                => test.fail("wrong reason for an over-budget expansion")
+        Ok(_)                                 => test.fail("this document expands past a hundred nodes")
+
+    test.case("the per-anchor bound names the anchor doing the damage")
+    let per = yamlsafe.with_max_alias_uses(yamlsafe.standard(), 4)
+    match yamlread.parse(bomb, per)
+        Err(AliasRepeatExceeded(_, _, name, limit)) =>
+            test.assert(limit == 4)
+            test.assert(name == "a" or name == "b" or name == "c")
+        Err(_)                                      => test.fail("wrong reason for an over-used anchor")
+        Ok(_)                                       => test.fail("each anchor here is expanded nine times")
+
+    test.case("and the hardened policy refuses the aliases outright")
+    match yamlread.parse(bomb, yamlsafe.hardened())
+        Err(_) => test.assert(true)
+        Ok(_)  => test.fail("hardened() turns aliases off entirely")
+
+@test
+fn test_anchors_do_not_cross_a_document_boundary() [io]
+    // YAML 1.2 § 3.2.2.2 scopes an anchor to its document; an alias
+    // reaching backwards past a `---` would be reading another
+    // document's data.
+    test.case("an alias to an anchor in the previous document is UnknownAnchor")
+    match yamlread.parse_stream("a: &base 1\n---\nb: *base\n", yamlsafe.standard())
+        Err(UnknownAnchor(l, _, name)) =>
+            test.assert(l == 3)
+            test.assert(name == "base")
+        Err(_)                         => test.fail("wrong reason for an out-of-scope alias")
+        Ok(_)                          => test.fail("an anchor does not outlive its document")
+
+    test.case("within one document it resolves")
+    let doc = parsed("a: &base 1\nb: *base\n")
+    test.assert(kind_at(doc, "b") == "int")
+
+@test
+fn test_parse_refuses_a_multi_document_stream_and_parse_stream_takes_it() [io]
+    // Picking the first document for a caller who wrote `parse` is how
+    // a deployment applies half a manifest.
+    test.case("parse on a two-document stream is a refusal")
+    match yamlread.parse("a: 1\n---\nb: 2\n", yamlsafe.standard())
+        Err(_) => test.assert(true)
+        Ok(_)  => test.fail("a caller that wrote `parse` has a decision to make")
+
+    test.case("parse_stream takes it, in order")
+    match yamlread.parse_stream("a: 1\n---\nb: 2\n", yamlsafe.standard())
+        Ok(docs) =>
+            test.assert(list.len(docs) == 2)
+            test.assert(yamlkeys.has(docs[0], "a"))
+            test.assert(yamlkeys.has(docs[1], "b"))
+        Err(_)   => test.fail("two documents separated by `---` is a stream")
+
+    test.case("an empty stream is an empty list, not an error")
+    match yamlread.parse_stream("", yamlsafe.standard())
+        Ok(docs) => test.assert(list.len(docs) == 0)
+        Err(_)   => test.fail("an empty stream has no documents and no fault")
+
+@test
+fn test_read_all_is_charged_what_the_stream_costs_and_not_more() [io]
+    // THE ONE THING THIS SUITE PROVES BEFORE ANY BODY EXISTS.
+    // `read_all<S: Read[e]>` binds the trait's effect parameter and
+    // its clause is `[e]`; the standard library declares
+    // `impl Read[] for Buffer`, so at this call site `[e]` substitutes
+    // to nothing and this function's row stays `[io]`.  A signature
+    // that had SPENT `[io, fs]` would not compile here, which is the
+    // assertion, and the compiler makes it with every body a `todo()`.
+    test.case("read_all over an in-memory Buffer")
+    let src = Buffer.from_str("a: 1\n---\nb: 2\n")
+    match yamlread.read_all(src, yamlsafe.standard())
+        Ok(docs) => test.assert(list.len(docs) == 2)
+        Err(_)   => test.fail("two documents separated by `---`")
+    src.drop()
+
+@test
+fn test_check_is_parse_stream_with_the_ok_arm_dropped() [io]
+    test.case("a valid stream has no refusal")
+    match yamlread.check("a: 1\n", yamlsafe.standard())
+        Some(_) => test.fail("`a: 1` is valid YAML")
+        None    => test.assert(true)
+
+    test.case("an invalid one reports what parse would")
+    match yamlread.check("a:\n\tb: 1\n", yamlsafe.standard())
+        Some(e) => test.assert(yamlerror.line_of(e) == 2)
+        None    => test.fail("a tab in the indentation is a refusal")
+
+@test
+fn test_the_writer_emits_block_style_and_round_trips() [io]
+    let doc = parsed("db:\n  host: localhost\n  port: 5432\n")
+
+    test.case("block style, not flow")
+    let out = rendered(doc)
+    test.assert(str.contains(out, "\n  port: 5432"))
+    test.assert(not str.contains(out, "{"))
+
+    test.case("what it writes, it reads back to the same tree")
+    test.assert(yamlnode.equal(parsed(out), doc))
+
+    test.case("the output always ends in exactly one newline")
+    test.assert(str.ends_with(out, "\n"))
+    test.assert(not str.ends_with(out, "\n\n"))
+
+    test.case("a stream gets its separators whatever explicit_start says")
+    match yamlwrite.stream_to_string([YamlInt(1), YamlInt(2)], yamlwrite.standard())
+        Ok(s)  => test.assert(str.contains(s, "---"))
+        Err(_) => test.fail("two scalars are two documents")
+
+@test
+fn test_the_width_policy_says_what_happens_when_a_line_will_not_fit() [io]
+    // Three named cases and not an integer, because "wrap at 80" and
+    // "never exceed 80" are different for YAML: a plain scalar with no
+    // spaces in it cannot be folded without changing its value.
+    test.case("the standard style folds at 80")
+    match yamlwrite.standard().width
+        WidthFold(n) => test.assert(n == 80)
+        _            => test.fail("the standard style folds")
+
+    test.case("the exact style never folds, so output round-trips byte for byte")
+    match yamlwrite.exact().width
+        WidthUnlimited => test.assert(true)
+        _              => test.fail("exact() must not change a value's spelling")
+    test.assert(yamlwrite.exact().flow_threshold == 0)
+
+    test.case("and a caller can pick the third, which DOES re-spell a scalar")
+    let s = yamlwrite.with_width(yamlwrite.standard(), WidthQuoteFold(72))
+    match s.width
+        WidthQuoteFold(n) => test.assert(n == 72)
+        _                 => test.fail("with_width replaced the policy")
+
+@test
+fn test_a_string_that_would_resolve_to_something_else_comes_back_quoted() [io]
+    // The function a round trip is correct or incorrect because of.
+    test.case("needs_quote is true for the strings the schema would take")
+    test.assert(yamlwrite.needs_quote("true"))
+    test.assert(yamlwrite.needs_quote("null"))
+    test.assert(yamlwrite.needs_quote("1.5"))
+    test.assert(yamlwrite.needs_quote(""))
+
+    test.case("and false for an ordinary word")
+    test.assert(not yamlwrite.needs_quote("hello"))
+    test.assert(not yamlwrite.needs_quote("no"))
+
+    test.case("scalar_to_string applies that rule")
+    test.assert(yamlwrite.scalar_to_string(YamlStr("true")) == "\"true\"")
+    test.assert(yamlwrite.scalar_to_string(YamlBool(true)) == "true")
+    test.assert(yamlwrite.scalar_to_string(YamlNull) == "null")
+
+    test.case("so a string that spells a boolean survives the round trip")
+    let doc = YamlMap(pairs: [
+        YamlPair { key: YamlStr("a"), value: YamlStr("true") }])
+    test.assert(kind_at(parsed(rendered(doc)), "a") == "str")

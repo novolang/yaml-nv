@@ -1,0 +1,289 @@
+// yamlsafe.nv — the load-bearing interface: what makes this a SAFE
+// loader, as one value the caller can read.
+//
+// THE PROBLEM
+//
+// YAML's danger is not its syntax, it is its extensibility.  A tag
+// tells a loader to CONSTRUCT something, and the loaders that honour
+// that generally — PyYAML's `load`, Ruby's `Psych.load` before it was
+// changed, SnakeYAML's default constructor — turn a document into
+// remote code execution.  The industry's answer has been a second
+// function called `safe_load`, and the failure mode of that answer is
+// that the unsafe one is still the shorter name and still the default
+// in the examples people copy.
+//
+// So this package has no unsafe loader to be the default of.  There is
+// one reader, its safety is a `YamlLimits` value it takes, and the
+// value's `standard()` refuses every non-core tag.  Making the loader
+// unsafe means writing down which tags you are allowing, at the call
+// site, in a list someone reviewing the diff can see:
+//
+//     yamlsafe.allowing(yamlsafe.standard(), ["!Ref", "!GetAtt"])
+//
+// That is the whole design.  A caller who wanted CloudFormation's tags
+// has said so; a caller who wanted `!!python/object/apply` has to name
+// it, and no reviewer will let that through.
+//
+// THE THREE BUDGETS
+//
+// The other half of safety is arithmetic.  A YAML alias is a reference
+// and expanding it copies, so a document like
+//
+//     a: &a ["x","x","x","x","x","x","x","x","x"]
+//     b: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]
+//     c: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]
+//
+// grows by nine per line — the "billion laughs", and a twenty-line
+// file reaches a terabyte.  Three counters stop it, and each answers a
+// different question:
+//
+//   `max_depth`     — how deep may collections nest?  Bounds the
+//                     parser's recursion, so a `[[[[[[…` file is a
+//                     refusal rather than a stack overflow.
+//   `max_nodes`     — how many nodes may the expanded document hold?
+//                     The direct answer to the billion laughs, because
+//                     it counts the thing that grows.
+//   `max_alias_uses`— how many times may ONE anchor be expanded?  The
+//                     narrower bound, so the refusal names the anchor
+//                     doing the damage rather than the whole stream.
+//
+// Two bounds rather than one because `max_nodes` alone reports "this
+// document is too big", which is true and useless, while
+// `max_alias_uses` reports "`&b` was expanded 812 times", which is the
+// line to go and look at.
+//
+// The defaults are for a document a person wrote.  A caller with a
+// legitimately enormous generated document raises them ON PURPOSE, and
+// the raise is in its source where a reviewer sees it.
+
+// What this loader will and will not do with a document.
+//
+// Carried by value and passed to every reading function.  There is no
+// global default and no mutable configuration: two callers in one
+// program can hold different policies, and neither can change the
+// other's.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     let p = yamlsafe.standard()
+//     println("${p.max_depth}")                 // 64
+// ```
+pub struct YamlLimits
+    // How deep collections may nest.  Exceeding it is `TooDeep`.
+    max_depth: Int
+    // How many nodes the expanded document may hold, counted as
+    // `yamlnode.node_count` counts them.  Exceeding it is
+    // `AliasBudgetExceeded`.
+    max_nodes: Int
+    // How many times one anchor may be expanded.  Exceeding it is
+    // `AliasRepeatExceeded`, naming the anchor.
+    max_alias_uses: Int
+    // How long one scalar may be, in bytes.  A bound so that a
+    // document with one unclosed quote does not accumulate the whole
+    // file into one string before the parser finds out.
+    max_scalar_bytes: Int
+    // Tags this loader will honour beyond the core schema's, written
+    // exactly as they appear in the document — `"!Ref"`, `"!!binary"`.
+    // Empty in `standard()`.  A tag not in this list is `UnsafeTag`,
+    // NOT a silence: see the module header for why that is the whole
+    // safety design.
+    allowed_tags: [Str]
+
+    // Whether anchors and aliases are honoured at all.  `true` in
+    // `standard()`.  `hardened()` sets it false, which is the setting
+    // for a program reading documents from the internet, where the
+    // simplest correct policy is that references do not exist.
+    allow_aliases: Bool
+    // Whether a mapping may have a key that is itself a collection.
+    // `false` in `standard()`: `? [a, b]` is legal YAML that almost
+    // nothing downstream can represent, and a caller that does not
+    // expect one should be told rather than handed a tree it cannot
+    // walk.
+    allow_complex_keys: Bool
+
+// The policy to use unless something specific is wanted: every
+// non-core tag refused, aliases honoured, complex keys refused, and
+// budgets sized for a document a person wrote.
+//
+// `max_depth` 64, `max_nodes` 1,000,000, `max_alias_uses` 1,000,
+// `max_scalar_bytes` 4,194,304.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     let p = yamlsafe.standard()
+//     println("${list.len(p.allowed_tags)}")    // 0
+//     println("${p.allow_aliases}")             // true
+// ```
+pub fn standard() -> YamlLimits
+    todo("yaml-nv.yamlsafe.standard")
+
+// The policy for a document that arrived from somewhere you do not
+// control: no aliases at all, no complex keys, no tags, and budgets an
+// order of magnitude tighter.
+//
+// Turning aliases OFF rather than budgeting them is the point: a
+// hostile document's cheapest attack is the one aliases enable, and a
+// program reading a webhook body has no legitimate use for a
+// backreference.  `max_nodes` 10,000, `max_depth` 16,
+// `max_scalar_bytes` 65,536.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     println("${yamlsafe.hardened().allow_aliases}")   // false
+// ```
+pub fn hardened() -> YamlLimits
+    todo("yaml-nv.yamlsafe.hardened")
+
+// A policy with these tags added to the allowed list.
+//
+// THE ONE WAY TO WIDEN THIS LOADER, and it is a function taking a
+// literal list so that the widening appears in the caller's source:
+//
+// ```novo
+// use yamlsafe
+// use yamlread
+//
+// fn load_template(text: Str) -> Result<YamlValue, YamlError>
+//     let p = yamlsafe.allowing(yamlsafe.standard(), ["!Ref", "!GetAtt"])
+//     yamlread.parse(text, p)
+//
+// fn main() [io]
+//     match load_template("Bucket: !Ref MyBucket\n")
+//         Ok(_)  => println("loaded")
+//         Err(e) => println(e.message())
+// ```
+//
+// An allowed tag is honoured by being IGNORED — the node resolves as
+// if the tag were not there, and the tag itself is available from the
+// event stream for a caller that wants to act on it.  It is never used
+// to construct anything, because there is nothing in this package that
+// constructs, and that is what makes "allowing a tag" a safe thing to
+// be able to do.
+pub fn allowing(p: YamlLimits, tags: [Str]) -> YamlLimits
+    todo("yaml-nv.yamlsafe.allowing")
+
+// A policy with the node budget replaced.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     let p = yamlsafe.with_max_nodes(yamlsafe.standard(), 50000)
+//     println("${p.max_nodes}")                 // 50000
+// ```
+pub fn with_max_nodes(p: YamlLimits, n: Int) -> YamlLimits
+    todo("yaml-nv.yamlsafe.with_max_nodes")
+
+// A policy with the nesting bound replaced.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     println("${yamlsafe.with_max_depth(yamlsafe.standard(), 8).max_depth}")
+// ```
+pub fn with_max_depth(p: YamlLimits, n: Int) -> YamlLimits
+    todo("yaml-nv.yamlsafe.with_max_depth")
+
+// A policy with the per-anchor expansion bound replaced.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     let p = yamlsafe.with_max_alias_uses(yamlsafe.standard(), 4)
+//     println("${p.max_alias_uses}")            // 4
+// ```
+pub fn with_max_alias_uses(p: YamlLimits, n: Int) -> YamlLimits
+    todo("yaml-nv.yamlsafe.with_max_alias_uses")
+
+// A policy with anchors and aliases turned on or off.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     let p = yamlsafe.with_aliases(yamlsafe.standard(), false)
+//     println("${p.allow_aliases}")             // false
+// ```
+pub fn with_aliases(p: YamlLimits, on: Bool) -> YamlLimits
+    todo("yaml-nv.yamlsafe.with_aliases")
+
+// A policy with collection keys allowed or refused.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     let p = yamlsafe.with_complex_keys(yamlsafe.standard(), true)
+//     println("${p.allow_complex_keys}")        // true
+// ```
+pub fn with_complex_keys(p: YamlLimits, on: Bool) -> YamlLimits
+    todo("yaml-nv.yamlsafe.with_complex_keys")
+
+// Whether this policy would honour a tag, without parsing anything.
+//
+// The core schema's own tags — `tag:yaml.org,2002:str` and its
+// siblings, and their `!!str` shorthands — are always honoured and
+// answer `true` under every policy.  Everything else answers what
+// `allowed_tags` says.
+//
+// It is public so that a caller can check its own configuration
+// before it reads a file, and so that the rule is testable without a
+// document.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     let p = yamlsafe.standard()
+//     println("${yamlsafe.honours_tag(p, "!!str")}")             // true
+//     println("${yamlsafe.honours_tag(p, "!!python/object")}")   // false
+// ```
+pub fn honours_tag(p: YamlLimits, tag: Str) -> Bool
+    todo("yaml-nv.yamlsafe.honours_tag")
+
+// The tags this loader honours under every policy: the core schema's,
+// in both their full and shorthand spellings.
+//
+// It is the list a caller compares against when deciding what to put
+// in `allowing`, and the list this package's own documentation is
+// generated from rather than restated.
+//
+// ```novo
+// use yamlsafe
+//
+// fn main() [io]
+//     println("${list.len(yamlsafe.core_tags()) > 0}")   // true
+// ```
+pub fn core_tags() -> [Str]
+    todo("yaml-nv.yamlsafe.core_tags")
+
+// Whether a tree fits a policy's budgets, and which one it broke.
+//
+// `None` when it fits.  The reader applies these while it reads, so a
+// hostile document is refused before it is built; this is the same
+// check applied to a tree a caller ALREADY holds — one it built
+// itself, or one it is about to emit and then hand to a reader with a
+// stricter policy than its own.  Without it, a program that generates
+// YAML has no way to find out that its output will be refused except
+// by having it refused.
+//
+// ```novo
+// use yamlsafe
+// use yamlnode
+//
+// fn main() [io]
+//     let tight = yamlsafe.with_max_nodes(yamlsafe.standard(), 1)
+//     match yamlsafe.check(YamlSeq([YamlInt(1), YamlInt(2)]), tight)
+//         Some(_) => println("over budget")
+//         None    => println("fits")
+// ```
+pub fn check(v: YamlValue, p: YamlLimits) -> ?YamlError
+    todo("yaml-nv.yamlsafe.check")

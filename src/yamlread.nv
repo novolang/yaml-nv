@@ -1,0 +1,354 @@
+// yamlread.nv — the reader: a feed-and-drain state machine, and the
+// direct forms written on top of it.
+//
+// WHY THIS ONE HAS A FEED-AND-DRAIN READER AND toml-nv DOES NOT
+//
+// The difference is where a document ends.  A TOML document is not
+// complete until its last line, because a `[table]` header at the
+// bottom can add keys to a table defined at the top — so a
+// chunk-at-a-time TOML reader would buffer the whole file and only be
+// lying about it in its type.  A YAML STREAM is a sequence of
+// documents separated by `---`, and each one is complete when its
+// terminator arrives.  So a `feed` here can hand back finished
+// documents while the rest of the stream is still coming, which is
+// exactly what a caller tailing a Kubernetes manifest stream, reading
+// a multi-document config from a pipe, or parsing a log of YAML
+// records wants.  The shape is honest in both packages because in both
+// it matches what the format allows.
+//
+//     var r = yamlread.reader(yamlsafe.standard())
+//     let (r2, docs) = yamlread.feed(r, chunk)   // as many times as you like
+//     let rest = yamlread.finish(r2)!            // once, at end of stream
+//
+// A chunk may split anything — a line, a quoted scalar containing a
+// newline, a `---` between the second and third dash — and the reader
+// carries whatever it could not finish into the next call.  `feed`
+// returns a NEW reader rather than mutating one, because `[mutate]` is
+// a host effect and this package has none.
+//
+// HOW THE PACKAGE STAYS `core` WITH A STREAM IN ITS API
+//
+//     pub fn read_all<S: Read[e]>(src: S, p: YamlLimits) -> … [e]
+//
+// `S: Read[e]` binds the effect parameter of the standard library's
+// `Read` trait and the clause uses it (SPEC § 5.6), so the row means
+// "whatever the impl behind `S` supplies": `[io, fs]` for a file,
+// nothing at all for an in-memory buffer.  This package has not spent
+// an effect, it has said "whatever you hand me", and the impl that
+// supplies the cost is declared where the host is.  It is the same
+// machine as `feed` and `finish` with the pump written once, here,
+// instead of once per caller.
+//
+// HOW THIS DIFFERS FROM `std.yaml`
+//
+// `std.yaml` reads a FLAT subset — mappings and sequences of scalars,
+// no nesting, no flow style, no anchors, no multi-document streams —
+// and its whole error channel is `?T`, so a document that fails gives
+// `None` with no reason and no position.  Under `novo run` it can
+// shell out to `yq` for full fidelity, which means the answer depends
+// on whether a binary is installed; under LLVM it is the C subset
+// only.  It is not available at `@tier(embedded)`.
+//
+// This package is a native parser with positions, the safety policy
+// above, nesting, flow style, anchors, block scalars and streams — and
+// no subprocess anywhere, which is the difference that matters most:
+// a library whose behaviour depends on what is in `$PATH` cannot be
+// depended on.
+
+use yamlsafe
+use yamlerror
+
+// A YAML reader between chunks.
+//
+// Opaque in practice — the fields are here so the state is reviewable
+// rather than because a caller should read them — and carried by
+// value: `feed` returns the next one and the previous is finished
+// with.  A reader that has failed stays failed; `error` is what says
+// so, and every subsequent `feed` yields nothing.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     let r = yamlread.reader(yamlsafe.standard())
+//     println("${r.line}")                      // 1
+// ```
+pub struct YamlReader
+    // The policy this reader was built with, unchanged.
+    limits: YamlLimits
+    // The 1-based line the scanner is on.
+    line: Int
+    // The 1-based byte column within that line.
+    col: Int
+    // How many documents have been EMITTED so far in this stream.
+    doc_index: Int
+    // The indentation columns of the collections currently open,
+    // outermost first.  Its length is the current depth, which is
+    // what `max_depth` is checked against.
+    indents: [Int]
+    // Bytes of the current line not yet consumed, carried across a
+    // chunk boundary.
+    partial: Str
+    // Anchors defined so far in the CURRENT document, as alternating
+    // name and serialised node.  Cleared at each `---`, because YAML
+    // 1.2 § 3.2.2.2 scopes an anchor to its document and an alias
+    // that reached backwards past a boundary would be reading another
+    // document's data.
+    anchors: [Str]
+    // Nodes produced so far in the current document, against
+    // `max_nodes`.
+    nodes: Int
+    // The sticky failure's tag, or `-1`.  `error` reads it back as a
+    // `YamlError` with the position it was recorded at.
+    failed: Int
+    // The line the sticky failure was recorded at, or `-1`.
+    failed_line: Int
+    // The column the sticky failure was recorded at, or `-1`.
+    failed_col: Int
+
+// A reader at the start of a stream.
+//
+// A policy with a contradiction in it — a negative budget, say — does
+// not fail here, because a constructor has no error channel; it
+// produces a reader that is already failed, so the first `feed` yields
+// nothing and `error` says why.  That is one failure path instead of
+// two.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     let r = yamlread.reader(yamlsafe.hardened())
+//     match yamlread.error(r)
+//         Some(_) => println("bad policy")
+//         None    => println("ready")
+// ```
+pub fn reader(p: YamlLimits) -> YamlReader
+    todo("yaml-nv.yamlread.reader")
+
+// Feed the next chunk; get back the reader to feed the chunk after it,
+// and every document those bytes COMPLETED.
+//
+// A document is complete when a `---` or `...` terminator or the end
+// of the stream closes it.  A chunk that ends mid-document produces
+// nothing for it and the reader carries the partial state; a chunk
+// that completes three documents produces three.  An empty chunk is
+// legal and completes nothing — it is not an end-of-stream signal,
+// because a caller reading a socket gets empty reads for reasons that
+// are not the end.  `finish` is the end-of-stream signal.
+//
+// A failure does not throw away the documents already completed in
+// this chunk: they are returned, the reader is left failed, and
+// `error` says why.  A caller streaming a large manifest therefore
+// keeps everything up to the corruption, which is what a person
+// fixing the file wants to see.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     let r = yamlread.reader(yamlsafe.standard())
+//     let (_, docs) = yamlread.feed(r, bytes.from_str("a: 1\n---\nb: 2\n"))
+//     println("${list.len(docs)}")              // 1 — the second is unterminated
+// ```
+pub fn feed(r: YamlReader, chunk: Bytes) -> (YamlReader, [YamlValue])
+    todo("yaml-nv.yamlread.feed")
+
+// `feed` for a caller who has a `Str`.
+//
+// The same machine — the string is read as its bytes — and it exists
+// because a caller who has already read a file into a string should
+// not have to convert it back to bytes to hand it over.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     let r = yamlread.reader(yamlsafe.standard())
+//     let (_, docs) = yamlread.feed_str(r, "a: 1\n...\n")
+//     println("${list.len(docs)}")              // 1
+// ```
+pub fn feed_str(r: YamlReader, chunk: Str) -> (YamlReader, [YamlValue])
+    todo("yaml-nv.yamlread.feed_str")
+
+// End of stream: the last document, if it was not terminated, and the
+// verdict.
+//
+// A YAML stream's final document need not carry a terminator, so a
+// stream ending `b: 2` has a document in it that no `feed` has
+// emitted — this is where it comes out.  A stream that ended with a
+// terminator has nothing left and this returns an empty list, NOT a
+// document containing null.
+//
+// `Err` when the reader is failed, including the failure a `feed`
+// recorded earlier and the one only the end of the stream can find: a
+// flow collection or a quoted scalar that was never closed.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     let r = yamlread.reader(yamlsafe.standard())
+//     let (r2, _) = yamlread.feed_str(r, "a: 1\n")
+//     match yamlread.finish(r2)
+//         Ok(docs) => println("${list.len(docs)}")   // 1
+//         Err(e)   => println(e.message())
+// ```
+pub fn finish(r: YamlReader) -> Result<[YamlValue], YamlError>
+    todo("yaml-nv.yamlread.finish")
+
+// The sticky failure this reader is carrying, or `None`.
+//
+// Once set it is never cleared.  A YAML stream that has gone wrong at
+// line 4,000 does not come right at the next `---`: the indentation
+// state the parser would need to resynchronise is exactly the state
+// that is wrong, and a reader that guessed would emit documents that
+// are not in the file.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     let r = yamlread.reader(yamlsafe.standard())
+//     match yamlread.error(r)
+//         Some(_) => println("failed")
+//         None    => println("fine")
+// ```
+pub fn error(r: YamlReader) -> ?YamlError
+    todo("yaml-nv.yamlread.error")
+
+// Parse a single-document string.
+//
+// The common case, and the one every caller reaching for this package
+// has: one file, one document, a tree or a reason.  A stream with a
+// SECOND document is `BadDirective` at the `---` rather than silently
+// keeping the first — a caller that wrote `parse` and got a
+// multi-document file has a decision to make, and picking one for
+// them is how a deployment applies half a manifest.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     match yamlread.parse("db:\n  port: 5432\n", yamlsafe.standard())
+//         Ok(doc) => println("${yamlkeys.int_at(doc, "db.port")!}")
+//         Err(e)  => println(e.message())
+// ```
+pub fn parse(text: Str, p: YamlLimits) -> Result<YamlValue, YamlError>
+    todo("yaml-nv.yamlread.parse")
+
+// Parse a multi-document stream, in order.
+//
+// An empty stream is an empty list rather than an error, and a stream
+// of one document is a list of one — so a caller that does not know
+// which it has can always use this and count.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     match yamlread.parse_stream("a: 1\n---\nb: 2\n", yamlsafe.standard())
+//         Ok(docs) => println("${list.len(docs)}")   // 2
+//         Err(e)   => println(e.message())
+// ```
+pub fn parse_stream(text: Str, p: YamlLimits) -> Result<[YamlValue], YamlError>
+    todo("yaml-nv.yamlread.parse_stream")
+
+// Parse the bytes of a stream.
+//
+// The same parser: YAML is UTF-8 by specification, and this checks
+// that rather than assuming it — a `Bytes` that is not valid UTF-8 is
+// `UnexpectedByte` at the offending byte, with a position.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     match yamlread.parse_bytes(bytes.from_str("a: 1\n"), yamlsafe.standard())
+//         Ok(_)  => println("ok")
+//         Err(_) => println("not yaml")
+// ```
+pub fn parse_bytes(input: Bytes, p: YamlLimits) -> Result<[YamlValue], YamlError>
+    todo("yaml-nv.yamlread.parse_bytes")
+
+// Read a whole stream and parse the documents it held, charged exactly
+// what the stream costs.
+//
+// THE LOAD-BEARING SIGNATURE OF THIS MODULE.  `S: Read[e]` binds the
+// effect parameter of `Read` and the clause is `[e]`, so this package
+// is charged nothing and the caller is charged what its own impl
+// declared (SPEC § 5.6, and `docs/publishing.md` § Design).  A `File`
+// costs the caller `[io, fs]`; an in-memory `Buffer` costs nothing;
+// `yaml-nv` remains `core` either way.
+//
+// The stream's own failure is carried through as `Transport`, so a
+// caller can still tell a truncated read from a malformed document.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn load(path: Str) -> Result<[YamlValue], YamlError> [io, fs]
+//     match File.open_read(path)
+//         None    => Err(Transport(IoNotFound))
+//         Some(f) =>
+//             let h: File = f
+//             yamlread.read_all(h, yamlsafe.standard())
+//
+// fn main() [io, fs]
+//     match load("deploy.yaml")
+//         Ok(docs) => println("${list.len(docs)} document(s)")
+//         Err(e)   => println(yamlerror.render(e, "deploy.yaml"))
+// ```
+pub fn read_all<S: Read[e]>(src: S, p: YamlLimits) -> Result<[YamlValue], YamlError> [e]
+    todo("yaml-nv.yamlread.read_all")
+
+// The first refusal a parse would produce, for a caller that wants to
+// check a stream without keeping the trees.
+//
+// `None` when it parses.  It is `parse_stream` with the `Ok` arm
+// dropped, and it exists because a linter, a pre-commit hook, an
+// admission controller and an editor's save handler all ask exactly
+// this question and none of them wants the allocation.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     match yamlread.check("a:\n\tb: 1\n", yamlsafe.standard())
+//         Some(e) => println(e.message())       // a tab where a space is required
+//         None    => println("valid")
+// ```
+pub fn check(text: Str, p: YamlLimits) -> ?YamlError
+    todo("yaml-nv.yamlread.check")
+
+// The anchors a document defined, in the order they were defined.
+//
+// Names only — the nodes are already in the tree the alias expanded
+// into.  It is here because a tool that REWRITES YAML has to know
+// which names are taken before it invents one, and because a document
+// whose anchors are all unused is a document a person can simplify,
+// which is a lint worth being able to write.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+//
+// fn main() [io]
+//     let r = yamlread.reader(yamlsafe.standard())
+//     let (r2, _) = yamlread.feed_str(r, "a: &base 1\nb: *base\n")
+//     println("${list.len(yamlread.anchors_of(r2))}")
+// ```
+pub fn anchors_of(r: YamlReader) -> [Str]
+    todo("yaml-nv.yamlread.anchors_of")

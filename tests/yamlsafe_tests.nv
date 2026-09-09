@@ -1,0 +1,171 @@
+// yamlsafe_tests.nv — the API suite for the safety policy, which is
+// this package's load-bearing interface.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// yaml-nv.yamlsafe.<fn>`.  What is asserted is the design — that this
+// package has NO unsafe loader to be the default of, that widening it
+// is a thing a reviewer can see, and that the three budgets answer
+// three different questions.
+
+use std.test
+use yamlerror
+use yamlsafe
+
+@test
+fn test_the_standard_policy_refuses_every_non_core_tag() [io]
+    // THE DESIGN, ASSERTED.  There is one reader and its safety is a
+    // value; the value's default refuses everything the core schema
+    // does not define.  A package with a second `unsafe_load` would
+    // have made the shorter name the dangerous one, which is the
+    // mistake every YAML library in the world has made once.
+    let p = yamlsafe.standard()
+
+    test.case("no tags are allowed beyond the core schema's")
+    test.assert(list.len(p.allowed_tags) == 0)
+
+    test.case("the core schema's own tags are always honoured")
+    test.assert(yamlsafe.honours_tag(p, "!!str"))
+    test.assert(yamlsafe.honours_tag(p, "!!int"))
+    test.assert(yamlsafe.honours_tag(p, "tag:yaml.org,2002:map"))
+
+    test.case("and the dangerous ones never are")
+    test.assert(not yamlsafe.honours_tag(p, "!!python/object/apply"))
+    test.assert(not yamlsafe.honours_tag(p, "!ruby/object"))
+    test.assert(not yamlsafe.honours_tag(p, "!!javax.script.ScriptEngineManager"))
+
+    test.case("nor does an ordinary application tag nobody named")
+    test.assert(not yamlsafe.honours_tag(p, "!Ref"))
+
+@test
+fn test_widening_the_loader_is_a_call_a_reviewer_can_see() [io]
+    // `allowing` is the ONE way to widen this loader, and it takes a
+    // literal list so the widening appears in the caller's diff.
+    let p = yamlsafe.allowing(yamlsafe.standard(), ["!Ref", "!GetAtt"])
+
+    test.case("the named tags are honoured")
+    test.assert(yamlsafe.honours_tag(p, "!Ref"))
+    test.assert(yamlsafe.honours_tag(p, "!GetAtt"))
+
+    test.case("and nothing else is, including the dangerous ones")
+    test.assert(not yamlsafe.honours_tag(p, "!Sub"))
+    test.assert(not yamlsafe.honours_tag(p, "!!python/object/apply"))
+
+    test.case("the base policy is untouched — the value is copied, not edited")
+    test.assert(not yamlsafe.honours_tag(yamlsafe.standard(), "!Ref"))
+
+@test
+fn test_the_three_budgets_answer_three_different_questions() [io]
+    let p = yamlsafe.standard()
+
+    test.case("a depth bound, so a deeply nested file is a refusal not an overflow")
+    test.assert(p.max_depth == 64)
+
+    test.case("a node bound, which is the direct answer to a billion laughs")
+    test.assert(p.max_nodes == 1000000)
+
+    test.case("and a per-anchor bound, so a refusal can name the anchor")
+    test.assert(p.max_alias_uses == 1000)
+
+    test.case("a scalar bound, so one unclosed quote is not the whole file")
+    test.assert(p.max_scalar_bytes == 4194304)
+
+@test
+fn test_the_hardened_policy_turns_aliases_off_rather_than_budgeting_them() [io]
+    // For a document that arrived from somewhere you do not control,
+    // the simplest correct policy is that backreferences do not exist:
+    // a webhook body has no legitimate use for one, and a budget still
+    // lets an attacker spend it.
+    let h = yamlsafe.hardened()
+
+    test.case("aliases are off entirely")
+    test.assert(not h.allow_aliases)
+
+    test.case("and the standard policy still allows them")
+    test.assert(yamlsafe.standard().allow_aliases)
+
+    test.case("the budgets are an order of magnitude tighter")
+    test.assert(h.max_nodes == 10000)
+    test.assert(h.max_depth == 16)
+    test.assert(h.max_scalar_bytes == 65536)
+
+    test.case("no tags, and no collection keys")
+    test.assert(list.len(h.allowed_tags) == 0)
+    test.assert(not h.allow_complex_keys)
+
+@test
+fn test_complex_keys_are_refused_by_default_and_allowed_on_request() [io]
+    test.case("`? [a, b]` is legal YAML almost nothing downstream can hold")
+    test.assert(not yamlsafe.standard().allow_complex_keys)
+
+    test.case("a caller that handles them says so")
+    test.assert(yamlsafe.with_complex_keys(yamlsafe.standard(), true).allow_complex_keys)
+
+@test
+fn test_each_budget_can_be_replaced_one_at_a_time() [io]
+    let p = yamlsafe.standard()
+
+    test.case("with_max_nodes")
+    test.assert(yamlsafe.with_max_nodes(p, 50000).max_nodes == 50000)
+
+    test.case("with_max_depth")
+    test.assert(yamlsafe.with_max_depth(p, 8).max_depth == 8)
+
+    test.case("with_max_alias_uses")
+    test.assert(yamlsafe.with_max_alias_uses(p, 4).max_alias_uses == 4)
+
+    test.case("with_aliases")
+    test.assert(not yamlsafe.with_aliases(p, false).allow_aliases)
+
+    test.case("and each leaves the others alone")
+    let one = yamlsafe.with_max_depth(p, 8)
+    test.assert(one.max_nodes == p.max_nodes)
+    test.assert(one.allow_aliases == p.allow_aliases)
+
+@test
+fn test_check_measures_a_tree_the_caller_already_holds() [io]
+    // The reader applies the budgets while it reads; this is the same
+    // check on a tree built by hand, for the program that GENERATES
+    // YAML and needs to know its output will be accepted by a reader
+    // stricter than itself.
+    test.case("a tree inside the budget passes")
+    match yamlsafe.check(YamlSeq([YamlInt(1)]), yamlsafe.standard())
+        Some(_) => test.fail("a two-node tree fits a million-node budget")
+        None    => test.assert(true)
+
+    test.case("a tree over the node budget is AliasBudgetExceeded, carrying it")
+    let tight = yamlsafe.with_max_nodes(yamlsafe.standard(), 1)
+    match yamlsafe.check(YamlSeq([YamlInt(1), YamlInt(2)]), tight)
+        Some(AliasBudgetExceeded(_, _, limit)) => test.assert(limit == 1)
+        Some(_)                                => test.fail("wrong reason for a tree over the node budget")
+        None                                   => test.fail("three nodes do not fit a budget of one")
+
+    test.case("a tree over the depth budget is TooDeep, carrying it")
+    let shallow = yamlsafe.with_max_depth(yamlsafe.standard(), 1)
+    match yamlsafe.check(YamlSeq([YamlSeq([YamlInt(1)])]), shallow)
+        Some(TooDeep(_, _, limit)) => test.assert(limit == 1)
+        Some(_)                    => test.fail("wrong reason for a tree over the depth budget")
+        None                       => test.fail("two levels do not fit a depth of one")
+
+@test
+fn test_a_safety_refusal_is_distinguishable_from_a_syntax_one() [io]
+    // The two want different handling: a syntax error is a file to go
+    // and fix, and a safety refusal is an input that may be hostile.
+    // A caller that treated them the same would either alarm on typos
+    // or fail to notice an attack.
+    test.case("the tag refusal and the three budget refusals are safety")
+    test.assert(yamlerror.is_safety_refusal(UnsafeTag(1, 1, "!!python/object")))
+    test.assert(yamlerror.is_safety_refusal(AliasBudgetExceeded(1, 1, 100)))
+    test.assert(yamlerror.is_safety_refusal(AliasRepeatExceeded(1, 1, "b", 10)))
+    test.assert(yamlerror.is_safety_refusal(TooDeep(1, 1, 16)))
+
+    test.case("an indentation mistake is not")
+    test.assert(not yamlerror.is_safety_refusal(TabInIndent(4, 3)))
+    test.assert(not yamlerror.is_safety_refusal(BadIndent(4, 5, 2)))
+    test.assert(not yamlerror.is_safety_refusal(NoSuchKey("a.b")))
+
+@test
+fn test_core_tags_is_the_list_the_documentation_is_generated_from() [io]
+    test.case("it is not empty, and honours_tag agrees with it")
+    let tags = yamlsafe.core_tags()
+    test.assert(list.len(tags) > 0)
+    test.assert(yamlsafe.honours_tag(yamlsafe.standard(), tags[0]))

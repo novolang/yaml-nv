@@ -1,0 +1,301 @@
+// yamlnode.nv — the value tree, and the scalar resolution that decides
+// what a bare word means.
+//
+// THE CORE SCHEMA, AND WHY THAT IS THE WHOLE OF IT
+//
+// YAML 1.2 defines three schemas.  The FAILSAFE schema has only
+// strings, sequences and mappings.  The JSON schema adds null, boolean,
+// integer and float with JSON's spellings.  The CORE schema — YAML
+// 1.2 § 10.3, and what every reader means by "YAML" — adds the extra
+// spellings people actually write: `yes`/`no` are NOT among them, but
+// `True`, `NULL`, `~`, `0o17`, `0x1F`, `.inf` and `.NaN` are.
+//
+// This package resolves the core schema and stops there.  What it does
+// NOT do is the thing that makes YAML dangerous: it never resolves a
+// tag by looking something up.  `!!python/object/apply` does not
+// construct anything, `!ruby/object` does not construct anything, and
+// an unrecognised `!tag` is a refusal rather than a silence — see
+// `yamlsafe`, which is where that decision lives and is configurable.
+//
+// THE NORWAY PROBLEM IS NOT A BUG HERE
+//
+// YAML 1.1 resolved `no` to false, which is why a country list
+// containing Norway loses a country.  YAML 1.2's core schema does not:
+// `no` is the string `"no"`.  This package implements 1.2, so `NO`,
+// `no`, `off` and `y` are all strings, and only `true`/`True`/`TRUE`
+// and `false`/`False`/`FALSE` are booleans.  A caller that WANTS the
+// 1.1 reading — because it is reading files written for a 1.1 loader —
+// asks for it on the `YamlSchema` value rather than getting it by
+// default, because the default that loses Norway should be the one you
+// choose.
+//
+// A MAPPING IS AN ORDERED LIST OF PAIRS, AND ITS KEYS ARE NODES
+//
+// Ordered for the same reason toml-nv's tables are: a document read and
+// written again should come back in the order it was written, and
+// `DuplicateKey` has to stay representable so the parser can refuse it.
+// Keys are `YamlValue` and not `Str` because YAML permits a sequence or
+// a mapping as a key — `? [a, b]` — and a tree that could not hold one
+// would make a legal document unparseable.  `yamlkeys`' path lookups
+// only walk STRING keys, which is what a caller reading a config file
+// wants, and `pairs_of` is there for the caller that needs the rest.
+
+// A YAML node: the core schema's six kinds and nothing else.
+//
+// There is no `YamlTagged` arm.  A tag that survives `yamlsafe`'s
+// policy has resolved to one of these; a tag that does not is a
+// refusal.  Keeping an unresolved tag in the tree would push the
+// safety decision onto every consumer, which is exactly the mistake
+// that makes YAML loaders unsafe.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     println(yamlnode.kind_name(YamlInt(8080)))    // int
+// ```
+pub enum YamlValue
+    // A mapping: its pairs in the order the document wrote them.
+    // Block and flow mappings are the same value; which one it was is
+    // a spelling the writer chooses.
+    YamlMap(pairs: [YamlPair])
+    // A sequence.  Block and flow sequences are again the same value.
+    YamlSeq(items: [YamlValue])
+    // A string, already unescaped, with block scalar folding and
+    // chomping applied.
+    YamlStr(value: Str)
+    // A signed 64-bit integer.  The core schema's forms: decimal with
+    // an optional sign, `0o` octal, `0x` hex.  A literal outside the
+    // range resolves to a STRING rather than wrapping, because that
+    // is what the schema says an unresolvable scalar is.
+    YamlInt(value: Int)
+    // A 64-bit float, including `.inf`, `-.inf` and `.nan`.
+    YamlFloat(value: Float)
+    // `true` or `false`, in the core schema's spellings only.
+    YamlBool(value: Bool)
+    // The null node: `null`, `Null`, `NULL`, `~`, and the empty
+    // scalar.  A distinct arm rather than an absence, because YAML
+    // distinguishes `a:` — which binds `a` to null — from a document
+    // in which `a` does not appear, and a caller checking a config
+    // file for an explicitly blanked setting needs the difference.
+    YamlNull
+
+// One key and its value, in document order.
+//
+// `key` is a `YamlValue` because YAML permits a collection as a key.
+// In practice it is almost always `YamlStr`, and `yamlkeys.str_key_of`
+// is the shortcut for a caller that only handles those.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     let p = YamlPair { key: YamlStr("port"), value: YamlInt(8080) }
+//     println(yamlnode.kind_name(p.key))            // str
+// ```
+pub struct YamlPair
+    // The key node, resolved by the same rules as any other scalar —
+    // so `1: a` has an INTEGER key, which is a thing YAML documents do
+    // and a `Str`-keyed tree would have silently stringified.
+    key: YamlValue
+    // What it is bound to.
+    value: YamlValue
+
+// Which arm a node is, as a value a caller can match or print.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     match yamlnode.kind_of(YamlNull)
+//         KindNull => println("null")
+//         _        => println("something else")
+// ```
+pub enum YamlKind
+    KindMap
+    KindSeq
+    KindStr
+    KindInt
+    KindFloat
+    KindBool
+    KindNull
+
+// Which of YAML 1.2's schemas resolves a bare scalar.
+//
+// The default everywhere in this package is `SchemaCore`.  The other
+// two are here because a caller sometimes has to read a file written
+// for a different reader, and choosing that should be visible at the
+// call site rather than hidden in a flag.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     match yamlnode.resolve("no", SchemaCore)
+//         YamlStr(s) => println(s)          // no — 1.2 keeps Norway
+//         _          => println("resolved to something else")
+// ```
+pub enum YamlSchema
+    // Strings, sequences and mappings, and nothing else resolves.
+    // Every scalar is a `YamlStr`.  It is the schema for a caller
+    // that wants no surprises at all — a templating tool, a diff, a
+    // formatter.
+    SchemaFailsafe
+    // JSON's types with JSON's spellings: `null`, `true`, `false`,
+    // decimal integers, decimal floats, and nothing else.
+    SchemaJson
+    // YAML 1.2 § 10.3: JSON's, plus `Null`/`NULL`/`~`, `True`/`TRUE`,
+    // `0o` and `0x` integers, `.inf` and `.nan`.  `no`, `off` and `y`
+    // are STRINGS.  The default.
+    SchemaCore
+    // YAML 1.1's boolean set, in which `yes`, `no`, `on` and `off`
+    // resolve to booleans and a sexagesimal `1:30` resolves to 90.
+    // For reading files written for a 1.1 loader.  It is named
+    // `SchemaLegacy11` and not `SchemaCompat` so that a reader of the
+    // call site knows what they are opting into: this is the schema
+    // in which the country Norway becomes `false`.
+    SchemaLegacy11
+
+// The kind of a node.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     match yamlnode.kind_of(YamlSeq([]))
+//         KindSeq => println("sequence")
+//         _       => println("not a sequence")
+// ```
+pub fn kind_of(v: YamlValue) -> YamlKind
+    todo("yaml-nv.yamlnode.kind_of")
+
+// The kind's name in the spelling YAML's own specification uses:
+// `"map"`, `"seq"`, `"str"`, `"int"`, `"float"`, `"bool"`, `"null"`.
+//
+// These are the strings `WrongKind` carries, so an error message and a
+// hand-written one say the same words.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     println(yamlnode.kind_name(YamlFloat(1.5)))   // float
+// ```
+pub fn kind_name(v: YamlValue) -> Str
+    todo("yaml-nv.yamlnode.kind_name")
+
+// Resolve a plain scalar's text to a node, under a schema.
+//
+// THE FUNCTION THE NORWAY PROBLEM LIVES IN, and it is public so that
+// the rule is testable and quotable rather than buried in a parser.  A
+// caller writing its own reader over `yamlread`'s events uses this to
+// get the same answers the tree does.
+//
+// Only PLAIN scalars resolve: a quoted scalar is a string whatever it
+// spells, which is why `"true"` and `'123'` come back as strings, and
+// why quoting is how a YAML author says "I mean the text".
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     match yamlnode.resolve("0o17", SchemaCore)
+//         YamlInt(n) => println("${n}")     // 15
+//         _          => println("not an integer")
+// ```
+pub fn resolve(text: Str, schema: YamlSchema) -> YamlValue
+    todo("yaml-nv.yamlnode.resolve")
+
+// How many pairs a mapping has, or how many items a sequence has.
+//
+// `0` for a scalar and for null, because "how long is this integer"
+// has no better answer.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     println("${yamlnode.len(YamlSeq([YamlInt(1), YamlInt(2)]))}")   // 2
+// ```
+pub fn len(v: YamlValue) -> Int
+    todo("yaml-nv.yamlnode.len")
+
+// A mapping's pairs, in document order.
+//
+// An empty list for anything that is not a mapping.  It is the escape
+// hatch for the documents `yamlkeys`' string paths cannot reach — a
+// mapping keyed by sequences, an integer-keyed table — and it is here
+// so that such a document is awkward rather than unreadable.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     let m = YamlMap(pairs: [
+//         YamlPair { key: YamlInt(1), value: YamlStr("one") }])
+//     println("${list.len(yamlnode.pairs_of(m))}")   // 1
+// ```
+pub fn pairs_of(v: YamlValue) -> [YamlPair]
+    todo("yaml-nv.yamlnode.pairs_of")
+
+// A sequence's items, in order.
+//
+// An empty list for anything that is not a sequence.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     println("${list.len(yamlnode.items_of(YamlSeq([YamlNull])))}")  // 1
+// ```
+pub fn items_of(v: YamlValue) -> [YamlValue]
+    todo("yaml-nv.yamlnode.items_of")
+
+// Two nodes compared structurally: same arm, same contents, and for
+// mappings the same pairs in the same ORDER.
+//
+// Order-sensitive because these are documents.  Two files binding the
+// same keys in a different order are different files, a formatter that
+// reordered them would be wrong, and a round-trip test needs the
+// strict answer.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     println("${yamlnode.equal(YamlNull, YamlNull)}")   // true
+// ```
+pub fn equal(a: YamlValue, b: YamlValue) -> Bool
+    todo("yaml-nv.yamlnode.equal")
+
+// The nesting depth of a node: `0` for a scalar, `1` for a collection
+// of scalars, and so on.
+//
+// `yamlsafe`'s depth budget is measured in these, and a caller about
+// to hand a tree to something with a recursion limit of its own uses
+// this to find out first.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     println("${yamlnode.depth(YamlSeq([YamlSeq([])]))}")   // 2
+// ```
+pub fn depth(v: YamlValue) -> Int
+    todo("yaml-nv.yamlnode.depth")
+
+// How many nodes a tree holds, counting every scalar and every
+// collection.
+//
+// The unit `yamlsafe`'s expansion budget is denominated in, so a
+// caller can compare a document it already holds against the budget it
+// is about to set.
+//
+// ```novo
+// use yamlnode
+//
+// fn main() [io]
+//     println("${yamlnode.node_count(YamlSeq([YamlInt(1)]))}")   // 2
+// ```
+pub fn node_count(v: YamlValue) -> Int
+    todo("yaml-nv.yamlnode.node_count")

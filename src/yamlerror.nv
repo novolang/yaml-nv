@@ -1,0 +1,213 @@
+// yamlerror.nv — every way a YAML stream can refuse to be read, and
+// where.
+//
+// WHY THE POSITION IS IN THE VARIANT AND NOT BESIDE IT
+//
+// YAML is whitespace-significant, so the mistakes people make in it are
+// mistakes of COLUMN: a key indented one space too far, a list item
+// under the wrong parent, a block scalar whose body is less indented
+// than its header.  A parser that said "mapping values are not allowed
+// here" without saying where — which is the message every YAML user has
+// seen and none has been helped by — leaves a person scanning a
+// two-hundred-line file for a space.  So every reason that has a
+// position carries the line AND the column, and the ones that do not
+// are honest about it: `line_of` answers `-1` rather than `0`.
+//
+// Lines and columns are 1-based, and the column is a BYTE offset into
+// the line.  Byte and not character: YAML is UTF-8 and this parser
+// checks it, but the file a person needs a position for is often the
+// file whose encoding went wrong, and a byte offset can always be
+// produced.
+//
+// THE SAFETY REFUSALS ARE ERRORS, NOT SILENCES
+//
+// `UnsafeTag` and the three budget arms are what make this a SAFE
+// loader, and they are loud on purpose.  A loader that quietly ignored
+// `!!python/object/apply` would leave a caller believing its input was
+// checked; a loader that quietly truncated an alias expansion would
+// hand back a document that is not the one in the file.  Both are
+// refusals with a position, and the caller decides what to do about
+// them.
+
+// Why a YAML stream, or a request about a parsed document, could not be
+// answered.
+//
+// ```novo
+// use yamlerror
+//
+// fn main() [io]
+//     let e = BadIndent(41, 5, 2)
+//     println("line ${yamlerror.line_of(e)}, col ${yamlerror.col_of(e)}")
+// ```
+pub enum YamlError
+    // A line's indentation does not put it under any open collection:
+    // a key indented past its parent's children, a sequence item
+    // indented less than the sequence it is in.  `want` is the column
+    // the open block expected, `col` the one that arrived — both,
+    // because "which is wrong" is a question about intent and this
+    // parser has no opinion.
+    BadIndent(line: Int, col: Int, want: Int)
+    // A tab character where YAML requires a space.  Its own arm and
+    // not `BadIndent`, because a tab is invisible in the editor that
+    // produced it and "line 41 column 3" alone sends a person looking
+    // for something they cannot see.
+    TabInIndent(line: Int, col: Int)
+    // A `:` where a mapping cannot start — the "mapping values are not
+    // allowed here" case — with the position of the colon.  `context`
+    // names what was open instead (`"a sequence"`, `"a flow
+    // mapping"`, `"a scalar"`) so the message can say what the
+    // parser thought it was reading.
+    UnexpectedMappingValue(line: Int, col: Int, context: Str)
+    // A `-` sequence entry where a sequence cannot start.
+    UnexpectedSequenceEntry(line: Int, col: Int, context: Str)
+    // A flow collection — `[…]` or `{…}` — that was never closed.  The
+    // position is the OPENING bracket, which is the byte a person has
+    // to go and fix.
+    UnterminatedFlow(line: Int, col: Int)
+    // A `]` or `}` that closes nothing, or closes the wrong kind.
+    UnexpectedFlowClose(line: Int, col: Int)
+    // A quoted scalar that was never closed.  The position is the
+    // opening quote.
+    UnterminatedQuote(line: Int, col: Int)
+    // An escape sequence inside a double-quoted scalar that YAML 1.2
+    // § 7.3.1 does not define.  `seq` is the escape as written.
+    BadEscape(line: Int, col: Int, seq: Str)
+    // A block scalar header — `|`, `>`, with their chomping and
+    // indentation indicators — that is malformed, or a block scalar
+    // body less indented than its header declared.  `why` is prose,
+    // because the header grammar has several rules and a caller
+    // printing one wants the sentence.
+    BadBlockScalar(line: Int, col: Int, why: Str)
+    // The same key twice in one mapping.  YAML 1.2 § 3.2.1.1 says keys
+    // are unique; most loaders keep the last one silently, and this
+    // one refuses, because a configuration file with `port` twice has
+    // a bug in it either way and the silent reading picks a winner
+    // nobody chose.  `first_line` is where the key was first bound.
+    DuplicateKey(line: Int, col: Int, key: Str, first_line: Int)
+    // An alias `*name` naming an anchor that has not been defined at
+    // this point in the stream.  Anchors are defined before use and
+    // do not cross document boundaries, so this covers both a typo
+    // and an alias reaching backwards past a `---`.
+    UnknownAnchor(line: Int, col: Int, name: Str)
+    // A tag this loader refuses to honour.  THE SAFETY REFUSAL: a
+    // safe loader resolves the core schema's tags and nothing else,
+    // and every language-specific tag — `!!python/object/apply`,
+    // `!ruby/object`, `!!java`, and every `!` tag a caller has not
+    // allowed — arrives here rather than being ignored.  `tag` is
+    // what was written, so the message can quote it back.
+    UnsafeTag(line: Int, col: Int, tag: Str)
+    // A tag handle that is syntactically wrong, or a `%TAG` directive
+    // whose prefix it needs was never declared.
+    BadTag(line: Int, col: Int, tag: Str)
+    // A `%` directive this loader does not implement, or a `%YAML`
+    // naming a version it will not read.  `directive` is the line.
+    BadDirective(line: Int, col: Int, directive: Str)
+    // The document nested collections deeper than the limits allowed.
+    // A bound rather than a stack overflow.
+    TooDeep(line: Int, col: Int, limit: Int)
+    // Expanding the aliases in this document would produce more nodes
+    // than the limits allowed.  THE BILLION-LAUGHS REFUSAL: a
+    // twenty-line document whose aliases expand to a terabyte is the
+    // classic YAML denial of service, and it is stopped by counting
+    // rather than by a heuristic.  `limit` is the budget, so the
+    // message can say what was exceeded and a caller can raise it
+    // deliberately.
+    AliasBudgetExceeded(line: Int, col: Int, limit: Int)
+    // One alias was expanded more times than the limits allowed.  A
+    // second, narrower bound than `AliasBudgetExceeded`: it catches
+    // the pathological document early, at the anchor doing the
+    // damage, so the message names one anchor rather than the whole
+    // stream.  `name` is that anchor.
+    AliasRepeatExceeded(line: Int, col: Int, name: Str, limit: Int)
+    // A byte that cannot appear where it appeared, including a byte
+    // that is not valid UTF-8.  `byte` is its value, so a message can
+    // print it as hex rather than as whatever it renders to.
+    UnexpectedByte(line: Int, col: Int, byte: Int)
+    // A lookup or a typed read asked for a key the document does not
+    // have.  No position: the fault is in the caller's path.
+    NoSuchKey(path: Str)
+    // A typed read found a node of the wrong kind.  `want` and `got`
+    // are `yamlnode.kind_name` spellings.  No position, because the
+    // node is where the document put it and the mistake is in the
+    // expectation.
+    WrongKind(path: Str, want: Str, got: Str)
+    // A writer was handed a document it cannot emit — a mapping key
+    // that is itself a collection under a policy that forbids one, a
+    // string with a byte no YAML scalar may hold.  `why` is prose.
+    NotEmittable(why: Str)
+    // The stream underneath `yamlread.read_all` failed.  The host's
+    // error, carried through unmodified: this package does not know
+    // what a socket timing out means to the program that opened it.
+    Transport(cause: IoError)
+
+// `YamlError` is an `Error`, which is what lets `Result<T, YamlError>`
+// exist at all (SPEC § 3.4).
+impl Error for YamlError
+    // The one-line message, for a caller printing rather than
+    // matching.
+    //
+    // The sentence names the rule and not the parser's state, and it
+    // does NOT include the position — `line_of` and `col_of` are
+    // separate so a caller can render `file:line:col: message` in
+    // whatever shape its own diagnostics have.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("yaml-nv.YamlError.message")
+
+// The 1-based line, or `-1` for the reasons that have no position.
+//
+// ```novo
+// use yamlerror
+//
+// fn main() [io]
+//     println("${yamlerror.line_of(NoSuchKey("db.host"))}")   // -1
+// ```
+pub fn line_of(e: YamlError) -> Int
+    todo("yaml-nv.yamlerror.line_of")
+
+// The 1-based byte column within that line, or `-1`.
+//
+// ```novo
+// use yamlerror
+//
+// fn main() [io]
+//     println("${yamlerror.col_of(TabInIndent(4, 3))}")       // 3
+// ```
+pub fn col_of(e: YamlError) -> Int
+    todo("yaml-nv.yamlerror.col_of")
+
+// `file:line:col: message`, the form an editor's error list parses.
+//
+// `path` is the caller's — this package never learned a filename,
+// because it never opened anything.  A reason with no position renders
+// as `file: message`, the colons omitted rather than filled with `-1`.
+//
+// ```novo
+// use yamlerror
+//
+// fn main() [io]
+//     println(yamlerror.render(TabInIndent(4, 3), "deploy.yaml"))
+// ```
+pub fn render(e: YamlError, path: Str) -> Str
+    todo("yaml-nv.yamlerror.render")
+
+// Whether this refusal is a SAFETY refusal rather than a syntax one.
+//
+// True for `UnsafeTag` and the three budget arms; false for
+// everything else.  The distinction matters to a caller because the
+// two want different handling: a syntax error is a file to go and fix,
+// and a safety refusal is an input that may be hostile — worth
+// logging, worth counting, and not worth retrying.  A caller that
+// treated the two the same would either alarm on typos or fail to
+// notice an attack.
+//
+// ```novo
+// use yamlerror
+//
+// fn main() [io]
+//     println("${yamlerror.is_safety_refusal(UnsafeTag(1, 1, "!!python/object"))}")
+//     println("${yamlerror.is_safety_refusal(TabInIndent(4, 3))}")   // false
+// ```
+pub fn is_safety_refusal(e: YamlError) -> Bool
+    todo("yaml-nv.yamlerror.is_safety_refusal")

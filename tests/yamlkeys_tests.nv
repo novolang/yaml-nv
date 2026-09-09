@@ -1,0 +1,298 @@
+// yamlkeys_tests.nv — the API suite for path access.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// yaml-nv.yamlkeys.<fn>`.  What is asserted is the contract of the two
+// lookup channels and of the path language — including the one place
+// this package deliberately differs from toml-nv's.
+//
+// The helpers read a fixture that is known good.  A case whose SUBJECT
+// is a refusal matches the `Result` in full instead.
+
+use std.test
+use yamlnode
+use yamlkeys
+
+// The integer at a path in a fixture that has one; `-1` stands in when
+// it does not, so a broken fixture fails the assertion below it rather
+// than reporting itself.
+fn int_of(v: YamlValue, path: Str) -> Int
+    match yamlkeys.int_at(v, path)
+        Ok(n)  => n
+        Err(_) => -1
+
+// The string at a path in a fixture that has one.
+fn str_of(v: YamlValue, path: Str) -> Str
+    match yamlkeys.str_at(v, path)
+        Ok(s)  => s
+        Err(_) => "«missing»"
+
+// A tree with one path set; the tree unchanged stands in when the set
+// fails.
+fn set_in(v: YamlValue, path: Str, value: YamlValue) -> YamlValue
+    match yamlkeys.set(v, path, value)
+        Ok(next) => next
+        Err(_)   => v
+
+// A tree with one path removed.
+fn removed(v: YamlValue, path: Str) -> YamlValue
+    match yamlkeys.remove(v, path)
+        Ok(next) => next
+        Err(_)   => v
+
+// A Kubernetes-shaped fixture, built by hand so these cases do not
+// depend on a parser:
+//
+//     spec:
+//       replicas: 3
+//       containers:
+//         - image: nginx
+//         - image: sidecar
+//     blank:
+fn manifest() -> YamlValue
+    YamlMap(pairs: [
+        YamlPair { key: YamlStr("spec"), value: YamlMap(pairs: [
+            YamlPair { key: YamlStr("replicas"), value: YamlInt(3) },
+            YamlPair { key: YamlStr("containers"), value: YamlSeq([
+                YamlMap(pairs: [
+                    YamlPair { key: YamlStr("image"), value: YamlStr("nginx") }]),
+                YamlMap(pairs: [
+                    YamlPair { key: YamlStr("image"), value: YamlStr("sidecar") }])]) }]) },
+        YamlPair { key: YamlStr("blank"), value: YamlNull }])
+
+@test
+fn test_a_numeric_segment_indexes_a_sequence() [io]
+    // THE ONE PLACE THIS PACKAGE DIFFERS FROM toml-nv's PATH LANGUAGE,
+    // and it is deliberate.  TOML has no index syntax and `a.0` there
+    // is a bare key called `0`, so treating digits as an index would
+    // be ambiguous in a format where it is not.  YAML mappings are
+    // keyed by NODES, so `0` as a key is an integer key a string path
+    // could never have addressed — the digits are free, and the
+    // manifests that are most of the world's YAML need to index lists.
+    test.case("a digit segment walks into a sequence")
+    test.assert(str_of(manifest(), "spec.containers.0.image") == "nginx")
+    test.assert(str_of(manifest(), "spec.containers.1.image") == "sidecar")
+
+    test.case("and a path past the end does not resolve")
+    match yamlkeys.find(manifest(), "spec.containers.2.image")
+        Some(_) => test.fail("there are two containers, not three")
+        None    => test.assert(true)
+
+@test
+fn test_the_two_channels_answer_different_questions() [io]
+    test.case("a missing key is NoSuchKey with the path the caller wrote")
+    match yamlkeys.int_at(manifest(), "spec.paused")
+        Err(NoSuchKey(p)) => test.assert(p == "spec.paused")
+        Err(_)            => test.fail("wrong reason for a missing key")
+        Ok(_)             => test.fail("`spec.paused` is not in the document")
+
+    test.case("a key of the wrong kind is WrongKind, naming both")
+    match yamlkeys.int_at(manifest(), "spec.containers.0.image")
+        Err(WrongKind(p, want, got)) =>
+            test.assert(p == "spec.containers.0.image")
+            test.assert(want == "int")
+            test.assert(got == "str")
+        Err(_)                       => test.fail("wrong reason for a kind mismatch")
+        Ok(_)                        => test.fail("an image name is a string")
+
+    test.case("the ?T channel folds both into None")
+    match yamlkeys.opt_int(manifest(), "spec.containers.0.image")
+        Some(_) => test.fail("an image name is not an integer")
+        None    => test.assert(true)
+    match yamlkeys.opt_int(manifest(), "spec.paused")
+        Some(_) => test.fail("`spec.paused` is not there")
+        None    => test.assert(true)
+
+    test.case("and it falls through to the caller's default")
+    test.assert((yamlkeys.opt_int(manifest(), "spec.replicas") ?? 1) == 3)
+    test.assert((yamlkeys.opt_int(manifest(), "spec.paused") ?? 1) == 1)
+
+@test
+fn test_an_explicitly_blanked_setting_is_not_an_absent_one() [io]
+    // `a:` in a config file is a person blanking a setting on purpose,
+    // and a program that treated it as absent would apply the default
+    // they were overriding.  `has` and `is_null_at` together are what
+    // tell the two apart.
+    test.case("a null-valued key IS present")
+    test.assert(yamlkeys.has(manifest(), "blank"))
+
+    test.case("and is null")
+    test.assert(yamlkeys.is_null_at(manifest(), "blank"))
+
+    test.case("a key that is not there is neither")
+    test.assert(not yamlkeys.has(manifest(), "absent"))
+    test.assert(not yamlkeys.is_null_at(manifest(), "absent"))
+
+@test
+fn test_typed_reads_do_not_coerce_except_int_to_float() [io]
+    test.case("an integer read as a string is a refusal, not \"3\"")
+    match yamlkeys.str_at(manifest(), "spec.replicas")
+        Err(WrongKind(_, _, _)) => test.assert(true)
+        Err(_)                  => test.fail("wrong reason")
+        Ok(_)                   => test.fail("an integer is not a string")
+
+    test.case("a float read as an integer is a refusal even when integral")
+    let d = YamlMap(pairs: [YamlPair { key: YamlStr("n"), value: YamlFloat(1.0) }])
+    match yamlkeys.int_at(d, "n")
+        Err(WrongKind(_, want, got)) =>
+            test.assert(want == "int")
+            test.assert(got == "float")
+        Err(_)                       => test.fail("wrong reason")
+        Ok(_)                        => test.fail("`1.0` resolves as a float, not an integer")
+
+    test.case("but an integer read as a float IS widened — the one asymmetry")
+    match yamlkeys.float_at(manifest(), "spec.replicas")
+        Ok(f)  => test.assert(f == 3.0)
+        Err(_) => test.fail("`timeout: 30` in a seconds field is a round number")
+
+    test.case("a bool_at on a Norway string is WrongKind, not a wrong value")
+    let no = YamlMap(pairs: [YamlPair { key: YamlStr("x"), value: YamlStr("no") }])
+    match yamlkeys.bool_at(no, "x")
+        Err(WrongKind(_, want, got)) =>
+            test.assert(want == "bool")
+            test.assert(got == "str")
+        Err(_)                       => test.fail("wrong reason")
+        Ok(_)                        => test.fail("under the core schema `no` is the string \"no\"")
+
+@test
+fn test_the_collection_reads() [io]
+    test.case("seq_at gives the items")
+    match yamlkeys.seq_at(manifest(), "spec.containers")
+        Ok(items) => test.assert(list.len(items) == 2)
+        Err(_)    => test.fail("`spec.containers` is a sequence")
+
+    test.case("map_at gives the pairs in document order")
+    match yamlkeys.map_at(manifest(), "spec")
+        Ok(ps) =>
+            test.assert(list.len(ps) == 2)
+            test.assert(yamlkeys.str_key_of(ps[0]) == Some("replicas"))
+        Err(_) => test.fail("`spec` is a mapping")
+
+    test.case("str_keys omits keys that are not strings")
+    let mixed = YamlMap(pairs: [
+        YamlPair { key: YamlStr("a"), value: YamlInt(1) },
+        YamlPair { key: YamlInt(2), value: YamlInt(3) }])
+    let ks = yamlkeys.str_keys(mixed)
+    test.assert(list.len(ks) == 1)
+    test.assert(ks[0] == "a")
+
+    test.case("and str_key_of answers None for one of them")
+    match yamlkeys.str_key_of(yamlnode.pairs_of(mixed)[1])
+        Some(_) => test.fail("an integer key is not a string key")
+        None    => test.assert(true)
+
+@test
+fn test_child_and_at_interpret_nothing() [io]
+    test.case("child takes a key whole, dots and digits included")
+    let d = YamlMap(pairs: [
+        YamlPair { key: YamlStr("a.b"), value: YamlInt(1) },
+        YamlPair { key: YamlStr("0"), value: YamlInt(2) }])
+    match yamlkeys.child(d, "a.b")
+        Some(v) => test.assert(yamlnode.equal(v, YamlInt(1)))
+        None    => test.fail("child does not split on the dot")
+    match yamlkeys.child(d, "0")
+        Some(v) => test.assert(yamlnode.equal(v, YamlInt(2)))
+        None    => test.fail("child does not read `0` as an index")
+
+    test.case("at is bounded in both directions")
+    let arr = YamlSeq([YamlInt(10), YamlInt(20)])
+    match yamlkeys.at(arr, 1)
+        Some(v) => test.assert(yamlnode.equal(v, YamlInt(20)))
+        None    => test.fail("index 1 of a 2-item sequence exists")
+    match yamlkeys.at(arr, 2)
+        Some(_) => test.fail("index 2 does not")
+        None    => test.assert(true)
+    match yamlkeys.at(arr, -1)
+        Some(_) => test.fail("a negative index is None, not the last item")
+        None    => test.assert(true)
+
+@test
+fn test_the_path_language_round_trips() [io]
+    test.case("segments split on the dot, digits included")
+    match yamlkeys.path_segments("spec.containers.0.image")
+        Ok(segs) =>
+            test.assert(list.len(segs) == 4)
+            test.assert(segs[2] == "0")
+        Err(_)   => test.fail("a four-segment path is four segments")
+
+    test.case("path_of is the inverse")
+    test.assert(yamlkeys.path_of(["spec", "replicas"]) == "spec.replicas")
+
+    test.case("paths lists leaves, sequence indices included")
+    let ps = yamlkeys.paths(manifest())
+    test.assert(list.len(ps) == 4)
+    test.assert(ps[0] == "spec.replicas")
+    test.assert(ps[1] == "spec.containers.0.image")
+
+@test
+fn test_set_returns_a_new_tree_and_appends_past_the_end() [io]
+    test.case("an existing key is replaced")
+    test.assert(int_of(set_in(manifest(), "spec.replicas", YamlInt(5)),
+                       "spec.replicas") == 5)
+
+    test.case("the original is untouched — no [mutate] in this package")
+    test.assert(int_of(manifest(), "spec.replicas") == 3)
+
+    test.case("a missing intermediate mapping is created")
+    test.assert(str_of(set_in(manifest(), "meta.name", YamlStr("web")),
+                       "meta.name") == "web")
+
+    test.case("an intermediate that is NOT a collection is WrongKind")
+    match yamlkeys.set(manifest(), "spec.replicas.deeper", YamlInt(1))
+        Err(WrongKind(_, _, _)) => test.assert(true)
+        Err(_)                  => test.fail("wrong reason")
+        Ok(_)                   => test.fail("setting through an integer loses it")
+
+    test.case("an index past the end APPENDS rather than padding with nulls")
+    let grown = set_in(manifest(), "spec.containers.9",
+                       YamlMap(pairs: [
+                           YamlPair { key: YamlStr("image"), value: YamlStr("new") }]))
+    match yamlkeys.seq_at(grown, "spec.containers")
+        Ok(items) => test.assert(list.len(items) == 3)
+        Err(_)    => test.fail("`spec.containers` is still a sequence")
+
+@test
+fn test_remove_shifts_a_sequence_and_refuses_a_typo() [io]
+    test.case("removing a sequence item shifts the rest down")
+    let cut = removed(manifest(), "spec.containers.0")
+    test.assert(str_of(cut, "spec.containers.0.image") == "sidecar")
+
+    test.case("removing a mapping key leaves the rest")
+    let bare = removed(manifest(), "spec.replicas")
+    test.assert(not yamlkeys.has(bare, "spec.replicas"))
+    test.assert(yamlkeys.has(bare, "spec.containers"))
+
+    test.case("removing a key that is not there is NoSuchKey")
+    match yamlkeys.remove(manifest(), "spec.paused")
+        Err(NoSuchKey(p)) => test.assert(p == "spec.paused")
+        Err(_)            => test.fail("wrong reason")
+        Ok(_)             => test.fail("a remove that succeeds on a typo hides it")
+
+@test
+fn test_merge_is_the_visible_version_of_yamls_own_merge_key() [io]
+    // YAML 1.1's `<<` resolves invisibly during a parse; this does the
+    // same job at a call site, where a reader can see it happen.
+    let base = YamlMap(pairs: [
+        YamlPair { key: YamlStr("spec"), value: YamlMap(pairs: [
+            YamlPair { key: YamlStr("replicas"), value: YamlInt(1) },
+            YamlPair { key: YamlStr("image"), value: YamlStr("nginx") }]) },
+        YamlPair { key: YamlStr("hosts"), value: YamlSeq([YamlStr("a"),
+                                                          YamlStr("b")]) }])
+    let over = YamlMap(pairs: [
+        YamlPair { key: YamlStr("spec"), value: YamlMap(pairs: [
+            YamlPair { key: YamlStr("replicas"), value: YamlInt(3) }]) },
+        YamlPair { key: YamlStr("hosts"), value: YamlSeq([YamlStr("c")]) }])
+
+    match yamlkeys.merge(base, over)
+        Ok(m)  =>
+            test.case("mappings merge key by key")
+            test.assert(int_of(m, "spec.replicas") == 3)
+
+            test.case("a key only in base survives")
+            test.assert(str_of(m, "spec.image") == "nginx")
+
+            test.case("a sequence REPLACES rather than appends — the caller decides")
+            match yamlkeys.seq_at(m, "hosts")
+                Ok(hs) => test.assert(list.len(hs) == 1)
+                Err(_) => test.fail("`hosts` is a sequence in both trees")
+
+        Err(_) => test.fail("two mappings always merge")

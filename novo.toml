@@ -1,0 +1,42 @@
+[package]
+name        = "yaml-nv"
+version     = "0.0.1"
+description = "The safe subset of YAML 1.2, read and written without performing anything: block and flow collections, the core schema's scalar resolution, anchors and aliases behind a budget that stops a billion-laughs document, multi-document streams, and an explicit refusal of the tags a safe loader must never honour.  A feed-and-drain reader over chunks, and a writer that emits block style under a named line-width policy."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  The reader is a feed-and-drain state machine the host pumps
+# — YAML's block structure is line-oriented, so a document boundary is
+# a thing a chunk can complete — and `read_all<S: Read[e]>` stays
+# inside the budget by BINDING its cost rather than spending one
+# (SPEC § 5.6).  Nothing here opens anything, and nothing here
+# resolves a tag by looking something up.
+layer       = "core"
+
+category    = "data"
+
+tags        = ["yaml", "yaml-1.2", "safe-load", "config", "parser", "sans-io", "data"]
+repository  = "https://github.com/novolang/yaml-nv"
+maintainers = ["novo-lang"]
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Reading and writing the safe subset of YAML"
+
+[dependencies]
+# None, and that is a property of the package rather than an accident.
+# YAML's core schema resolves a scalar by matching it against a fixed
+# set of regular forms — `true`, `0o17`, `1_000`, `.inf`, `null` — and
+# that is arithmetic over bytes.  The timestamp type is NOT in the
+# core schema (it is YAML 1.1's, and the `!!timestamp` tag in 1.2),
+# so this package has no dates in it and no reason to depend on
+# calendar-nv.  A document that wants one has a string, and the
+# caller parses it with whatever it already uses.

@@ -1,0 +1,149 @@
+// yamlcover_tests.nv — the rest of the public surface, one case each.
+//
+// RED ON PURPOSE, like every suite here: each assertion reaches `not
+// implemented: yaml-nv.<module>.<fn>`.
+//
+// The three suites beside this one assert the DESIGN — the safety
+// policy, the schemas, the reader's contract.  This one exists so that
+// no public function ships without a written expectation of what it
+// answers, including the ones whose behaviour is a single sentence.
+
+use std.test
+use yamlnode
+use yamlerror
+use yamlsafe
+use yamlkeys
+use yamlread
+use yamlwrite
+
+// A small mapping with one of each shape, built by hand.
+fn doc() -> YamlValue
+    YamlMap(pairs: [
+        YamlPair { key: YamlStr("host"), value: YamlStr("localhost") },
+        YamlPair { key: YamlStr("port"), value: YamlInt(5432) },
+        YamlPair { key: YamlStr("debug"), value: YamlBool(true) }])
+
+@test
+fn test_the_error_type_answers_position_and_renders_a_line() [io]
+    test.case("col_of is the byte column, 1-based")
+    test.assert(yamlerror.col_of(TabInIndent(4, 3)) == 3)
+
+    test.case("a reason with no position answers -1 in both")
+    test.assert(yamlerror.col_of(NoSuchKey("spec.replicas")) == -1)
+    test.assert(yamlerror.line_of(NoSuchKey("spec.replicas")) == -1)
+
+    test.case("render is the form an editor's error list parses")
+    test.assert(str.starts_with(yamlerror.render(TabInIndent(4, 3), "deploy.yaml"),
+                                "deploy.yaml:4:3: "))
+
+    test.case("and a reason with no position renders without the colons")
+    test.assert(str.starts_with(yamlerror.render(NoSuchKey("a.b"), "deploy.yaml"),
+                                "deploy.yaml: "))
+
+@test
+fn test_the_remaining_optional_reads() [io]
+    test.case("opt_str present and absent")
+    test.assert((yamlkeys.opt_str(doc(), "host") ?? "127.0.0.1") == "localhost")
+    test.assert((yamlkeys.opt_str(doc(), "user") ?? "postgres") == "postgres")
+
+    test.case("opt_bool")
+    test.assert(yamlkeys.opt_bool(doc(), "debug") ?? false)
+    test.assert(not (yamlkeys.opt_bool(doc(), "verbose") ?? false))
+
+    test.case("opt_float widens an integer, as float_at does")
+    test.assert((yamlkeys.opt_float(doc(), "port") ?? 0.0) == 5432.0)
+
+    test.case("and answers None for a node of the wrong kind")
+    match yamlkeys.opt_float(doc(), "host")
+        Some(_) => test.fail("a string is not a float")
+        None    => test.assert(true)
+
+@test
+fn test_parse_bytes_checks_utf8_rather_than_assuming_it() [io]
+    test.case("valid UTF-8 parses as the Str form does")
+    match yamlread.parse_bytes(bytes.from_str("a: 1\n"), yamlsafe.standard())
+        Ok(docs) => test.assert(list.len(docs) == 1)
+        Err(_)   => test.fail("`a: 1` is a YAML document")
+
+    test.case("a byte that is not UTF-8 is UnexpectedByte, with a position")
+    // `a: <0xFF>` — a lone 0xFF can start no UTF-8 sequence, so the
+    // parser has a byte to name and a place to name it.
+    match yamlread.parse_bytes(bytes.from_byte_list([97, 58, 32, 255]),
+                               yamlsafe.standard())
+        Err(UnexpectedByte(_, _, b)) => test.assert(b == 255)
+        Err(_)                       => test.fail("wrong reason for a bad byte")
+        Ok(_)                        => test.fail("0xFF is not valid UTF-8")
+
+@test
+fn test_anchors_of_lists_what_a_rewriting_tool_must_not_reuse() [io]
+    // A tool that rewrites YAML has to know which anchor names are
+    // taken before it invents one, and a document whose anchors are
+    // all unused is one a person can simplify — a lint worth being
+    // able to write.
+    test.case("the anchors a document defined, in definition order")
+    let r = yamlread.reader(yamlsafe.standard())
+    let (r2, _) = yamlread.feed_str(r, "a: &base 1\nb: *base\n...\n")
+    let names = yamlread.anchors_of(r2)
+    test.assert(list.len(names) == 1)
+    test.assert(names[0] == "base")
+
+    test.case("a document with no anchors has none")
+    let plain = yamlread.reader(yamlsafe.standard())
+    let (p2, _) = yamlread.feed_str(plain, "a: 1\n...\n")
+    test.assert(list.len(yamlread.anchors_of(p2)) == 0)
+
+@test
+fn test_the_writers_remaining_knobs() [io]
+    test.case("with_indent replaces the indent and leaves the rest")
+    let s = yamlwrite.with_indent(yamlwrite.standard(), 4)
+    test.assert(s.indent == 4)
+    test.assert(s.flow_threshold == yamlwrite.standard().flow_threshold)
+
+    test.case("the standard style indents two, which is what YAML looks like")
+    test.assert(yamlwrite.standard().indent == 2)
+
+    test.case("sequences sit at the parent's column by default")
+    test.assert(not yamlwrite.standard().indent_sequences)
+
+    test.case("and exact() marks its documents explicitly at both ends")
+    test.assert(yamlwrite.exact().explicit_start)
+    test.assert(yamlwrite.exact().explicit_end)
+
+@test
+fn test_to_bytes_is_to_strings_utf8() [io]
+    test.case("for a caller writing to a socket, without a round trip through Str")
+    match yamlwrite.to_bytes(doc(), yamlwrite.standard())
+        Ok(b)  =>
+            match yamlwrite.to_string(doc(), yamlwrite.standard())
+                Ok(s)  => test.assert(bytes.to_str(b) == s)
+                Err(_) => test.fail("the fixture renders")
+        Err(_) => test.fail("the fixture renders")
+
+@test
+fn test_the_writer_refuses_only_what_it_cannot_emit() [io]
+    test.case("a bare scalar IS a document, so check passes it")
+    match yamlwrite.check(YamlInt(1))
+        Some(_) => test.fail("a scalar is a valid YAML document")
+        None    => test.assert(true)
+
+    test.case("and a tree that came out of the reader always passes")
+    match yamlwrite.check(doc())
+        Some(_) => test.fail("a mapping of scalars is emittable")
+        None    => test.assert(true)
+
+    test.case("emitting is a separate question from fitting a reader's budget")
+    // `yamlwrite.check` asks "can this be written"; `yamlsafe.check`
+    // asks "would a reader with this policy accept it".  A program
+    // emitting for a stricter reader than itself asks both, which is
+    // why they are two functions.
+    let tight = yamlsafe.with_max_nodes(yamlsafe.standard(), 1)
+    match yamlsafe.check(doc(), tight)
+        Some(_) => test.assert(true)
+        None    => test.fail("a four-node tree does not fit a budget of one")
+
+@test
+fn test_kind_of_and_kind_name_agree_on_every_arm() [io]
+    test.case("the two views of a node's kind never disagree")
+    match yamlnode.kind_of(YamlNull)
+        KindNull => test.assert(yamlnode.kind_name(YamlNull) == "null")
+        _        => test.fail("null is KindNull")

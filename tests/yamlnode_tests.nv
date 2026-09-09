@@ -1,0 +1,213 @@
+// yamlnode_tests.nv — the API suite for the value tree and for scalar
+// resolution.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// yaml-nv.yamlnode.<fn>`.  What is asserted is which schema resolves
+// what — including the Norway problem, which is the single most
+// consequential rule in this package.
+
+use std.test
+use yamlnode
+
+// A two-key mapping, built by hand.
+fn config() -> YamlValue
+    YamlMap(pairs: [
+        YamlPair { key: YamlStr("host"), value: YamlStr("localhost") },
+        YamlPair { key: YamlStr("port"), value: YamlInt(5432) }])
+
+@test
+fn test_kind_of_names_every_arm() [io]
+    test.case("collections")
+    match yamlnode.kind_of(config())
+        KindMap => test.assert(true)
+        _       => test.fail("a mapping is KindMap")
+
+    match yamlnode.kind_of(YamlSeq([]))
+        KindSeq => test.assert(true)
+        _       => test.fail("a sequence is KindSeq")
+
+    test.case("scalars")
+    match yamlnode.kind_of(YamlStr("a"))
+        KindStr => test.assert(true)
+        _       => test.fail("a string is KindStr")
+
+    match yamlnode.kind_of(YamlInt(1))
+        KindInt => test.assert(true)
+        _       => test.fail("an integer is KindInt")
+
+    match yamlnode.kind_of(YamlFloat(1.5))
+        KindFloat => test.assert(true)
+        _         => test.fail("a float is KindFloat")
+
+    match yamlnode.kind_of(YamlBool(true))
+        KindBool => test.assert(true)
+        _        => test.fail("a boolean is KindBool")
+
+    test.case("null is a NODE, not an absence")
+    match yamlnode.kind_of(YamlNull)
+        KindNull => test.assert(true)
+        _        => test.fail("null is its own kind")
+
+@test
+fn test_the_core_schema_keeps_norway() [io]
+    // THE SINGLE MOST CONSEQUENTIAL RULE IN THIS PACKAGE.  YAML 1.1
+    // resolved `no` to false, which is why a country list containing
+    // Norway loses a country.  YAML 1.2's core schema does not, this
+    // package implements 1.2, and the 1.1 reading is available only to
+    // a caller that asked for it by name.
+    test.case("`no` is the string \"no\"")
+    match yamlnode.resolve("no", SchemaCore)
+        YamlStr(s) => test.assert(s == "no")
+        _          => test.fail("YAML 1.2's core schema has no `no` boolean")
+
+    test.case("and so are `NO`, `off`, `yes`, `on`, `y` and `n`")
+    match yamlnode.resolve("off", SchemaCore)
+        YamlStr(_) => test.assert(true)
+        _          => test.fail("`off` is a string under the core schema")
+    match yamlnode.resolve("yes", SchemaCore)
+        YamlStr(_) => test.assert(true)
+        _          => test.fail("`yes` is a string under the core schema")
+
+    test.case("only true/True/TRUE and false/False/FALSE are booleans")
+    match yamlnode.resolve("True", SchemaCore)
+        YamlBool(b) => test.assert(b)
+        _           => test.fail("`True` is the core schema's boolean")
+    match yamlnode.resolve("FALSE", SchemaCore)
+        YamlBool(b) => test.assert(not b)
+        _           => test.fail("`FALSE` is the core schema's boolean")
+
+    test.case("the 1.1 reading is available, and named so a caller knows")
+    match yamlnode.resolve("no", SchemaLegacy11)
+        YamlBool(b) => test.assert(not b)
+        _           => test.fail("SchemaLegacy11 is where Norway becomes false")
+
+@test
+fn test_the_core_schemas_remaining_scalar_forms() [io]
+    test.case("null in all four spellings")
+    match yamlnode.resolve("~", SchemaCore)
+        YamlNull => test.assert(true)
+        _        => test.fail("`~` is null")
+    match yamlnode.resolve("NULL", SchemaCore)
+        YamlNull => test.assert(true)
+        _        => test.fail("`NULL` is null")
+    match yamlnode.resolve("", SchemaCore)
+        YamlNull => test.assert(true)
+        _        => test.fail("the empty scalar is null")
+
+    test.case("integers in decimal, octal and hex")
+    match yamlnode.resolve("0o17", SchemaCore)
+        YamlInt(n) => test.assert(n == 15)
+        _          => test.fail("`0o17` is 15")
+    match yamlnode.resolve("0x1F", SchemaCore)
+        YamlInt(n) => test.assert(n == 31)
+        _          => test.fail("`0x1F` is 31")
+    match yamlnode.resolve("-42", SchemaCore)
+        YamlInt(n) => test.assert(n == -42)
+        _          => test.fail("`-42` is an integer")
+
+    test.case("floats, including the infinities and the NaN")
+    match yamlnode.resolve("1.5", SchemaCore)
+        YamlFloat(f) => test.assert(f == 1.5)
+        _            => test.fail("`1.5` is a float")
+    match yamlnode.resolve(".inf", SchemaCore)
+        YamlFloat(_) => test.assert(true)
+        _            => test.fail("`.inf` is a float, not a string")
+    match yamlnode.resolve(".NaN", SchemaCore)
+        YamlFloat(_) => test.assert(true)
+        _            => test.fail("`.NaN` is a float")
+
+    test.case("an integer past the 64-bit range resolves to a STRING, not a wrap")
+    match yamlnode.resolve("99999999999999999999", SchemaCore)
+        YamlStr(_) => test.assert(true)
+        _          => test.fail("an unresolvable scalar is a string, per the schema")
+
+@test
+fn test_the_other_two_schemas_resolve_less() [io]
+    test.case("the failsafe schema resolves nothing at all")
+    match yamlnode.resolve("true", SchemaFailsafe)
+        YamlStr(s) => test.assert(s == "true")
+        _          => test.fail("the failsafe schema has strings, seqs and maps")
+    match yamlnode.resolve("1", SchemaFailsafe)
+        YamlStr(_) => test.assert(true)
+        _          => test.fail("the failsafe schema has no integers")
+
+    test.case("the JSON schema has JSON's spellings only")
+    match yamlnode.resolve("null", SchemaJson)
+        YamlNull => test.assert(true)
+        _        => test.fail("`null` is JSON's null")
+    match yamlnode.resolve("NULL", SchemaJson)
+        YamlStr(_) => test.assert(true)
+        _          => test.fail("`NULL` is not JSON's spelling")
+    match yamlnode.resolve("0x1F", SchemaJson)
+        YamlStr(_) => test.assert(true)
+        _          => test.fail("JSON has no hex integers")
+
+@test
+fn test_kind_name_uses_the_specification_spelling() [io]
+    test.case("the names an error message quotes")
+    test.assert(yamlnode.kind_name(YamlStr("a")) == "str")
+    test.assert(yamlnode.kind_name(YamlInt(1)) == "int")
+    test.assert(yamlnode.kind_name(YamlFloat(1.0)) == "float")
+    test.assert(yamlnode.kind_name(YamlBool(true)) == "bool")
+    test.assert(yamlnode.kind_name(YamlNull) == "null")
+    test.assert(yamlnode.kind_name(YamlSeq([])) == "seq")
+    test.assert(yamlnode.kind_name(config()) == "map")
+
+@test
+fn test_a_mapping_key_is_a_node_and_can_be_a_collection() [io]
+    // Keys are `YamlValue` and not `Str` because YAML permits a
+    // sequence or a mapping as a key, and a tree that could not hold
+    // one would make a legal document unparseable.
+    test.case("an integer key stays an integer")
+    let m = YamlMap(pairs: [
+        YamlPair { key: YamlInt(1), value: YamlStr("one") }])
+    let ps = yamlnode.pairs_of(m)
+    test.assert(list.len(ps) == 1)
+    test.assert(yamlnode.kind_name(ps[0].key) == "int")
+
+    test.case("and a sequence key is representable")
+    let complex = YamlMap(pairs: [
+        YamlPair { key: YamlSeq([YamlStr("a"), YamlStr("b")]), value: YamlInt(1) }])
+    test.assert(yamlnode.kind_name(yamlnode.pairs_of(complex)[0].key) == "seq")
+
+@test
+fn test_len_and_items_and_pairs_count_what_is_there() [io]
+    test.case("a mapping's pairs and a sequence's items")
+    test.assert(yamlnode.len(config()) == 2)
+    test.assert(yamlnode.len(YamlSeq([YamlInt(1), YamlInt(2)])) == 2)
+
+    test.case("a scalar and null have no length, and that is 0 not a panic")
+    test.assert(yamlnode.len(YamlInt(1)) == 0)
+    test.assert(yamlnode.len(YamlNull) == 0)
+
+    test.case("pairs_of and items_of are empty for the wrong kind")
+    test.assert(list.len(yamlnode.pairs_of(YamlSeq([YamlInt(1)]))) == 0)
+    test.assert(list.len(yamlnode.items_of(config())) == 0)
+
+@test
+fn test_equal_is_order_sensitive_on_mappings() [io]
+    // Documents, not maps: two files binding the same keys in a
+    // different order are different files.
+    test.case("same pairs, same order")
+    test.assert(yamlnode.equal(config(), config()))
+
+    test.case("same pairs, different order, NOT equal")
+    let swapped = YamlMap(pairs: [
+        YamlPair { key: YamlStr("port"), value: YamlInt(5432) },
+        YamlPair { key: YamlStr("host"), value: YamlStr("localhost") }])
+    test.assert(not yamlnode.equal(config(), swapped))
+
+    test.case("null is not the empty string, and 1 is not 1.0")
+    test.assert(not yamlnode.equal(YamlNull, YamlStr("")))
+    test.assert(not yamlnode.equal(YamlInt(1), YamlFloat(1.0)))
+
+@test
+fn test_depth_and_node_count_are_the_units_the_budgets_use() [io]
+    test.case("depth: a scalar is 0, a flat collection 1")
+    test.assert(yamlnode.depth(YamlInt(1)) == 0)
+    test.assert(yamlnode.depth(config()) == 1)
+    test.assert(yamlnode.depth(YamlSeq([YamlSeq([])])) == 2)
+
+    test.case("node_count counts collections as well as scalars")
+    test.assert(yamlnode.node_count(YamlInt(1)) == 1)
+    test.assert(yamlnode.node_count(YamlSeq([YamlInt(1)])) == 2)

@@ -1,0 +1,471 @@
+// yamlkeys.nv — reaching into a parsed document by path.
+//
+// TWO CHANNELS, AND WHICH ONE TO USE
+//
+// Every lookup comes in two forms and they answer different questions:
+//
+//   `get`, `str_at`, `int_at`, …    ->  Result<T, YamlError>
+//   `find`, `opt_str`, `opt_int`, … ->  ?T
+//
+// The `Result` form is for a caller reading a REQUIRED setting: it
+// distinguishes `NoSuchKey("spec.replicas")` from
+// `WrongKind("spec.replicas", "int", "str")`, which are two different
+// sentences to show a user and two different fixes.  The `?T` form is
+// for an OPTIONAL one, where "absent" and "the wrong shape" both mean
+// "use the default".
+//
+// THE PATH LANGUAGE WALKS MAPPINGS AND SEQUENCES BOTH
+//
+// `"spec.template.spec.containers.0.image"` — a dot between segments,
+// and a segment that is all digits indexes a SEQUENCE.  That is a
+// choice worth naming, because toml-nv makes the opposite one: TOML
+// has no index syntax and `a.0` there is a bare key called `0`, so
+// treating it as an index would be ambiguous in a format where it is
+// not.  YAML mappings are keyed by nodes rather than by strings, and
+// `0` as a mapping key is an INTEGER key that a string path could not
+// have addressed anyway — so the digits are free, and the Kubernetes
+// manifests that are most of the world's YAML are exactly the
+// documents that need to index a list.
+//
+// A mapping that really does have the string key `"0"` is reached with
+// `child`, which takes the key whole and interprets nothing.  A
+// mapping keyed by a sequence is reached with `yamlnode.pairs_of`,
+// because no string path can name it.
+
+use yamlnode
+
+// The node at a path, or why not.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+// use yamlnode
+//
+// fn main() [io]
+//     let doc = yamlread.parse("db:\n  port: 5432\n", yamlsafe.standard())!
+//     match yamlkeys.get(doc, "db.port")
+//         Ok(v)  => println(yamlnode.kind_name(v))   // int
+//         Err(e) => println(e.message())
+// ```
+pub fn get(v: YamlValue, path: Str) -> Result<YamlValue, YamlError>
+    todo("yaml-nv.yamlkeys.get")
+
+// The node at a path, or `None`.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("db: {}\n", yamlsafe.standard())!
+//     match yamlkeys.find(doc, "db.host")
+//         Some(_) => println("set")
+//         None    => println("unset")
+// ```
+pub fn find(v: YamlValue, path: Str) -> ?YamlValue
+    todo("yaml-nv.yamlkeys.find")
+
+// Whether a path resolves.
+//
+// A path resolving to the NULL node answers `true`: `a:` binds `a`,
+// and a caller asking whether a setting was written needs that
+// distinguished from a setting that is absent.  `is_null_at` is the
+// other half of that question.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("a:\n", yamlsafe.standard())!
+//     println("${yamlkeys.has(doc, "a")}")      // true
+// ```
+pub fn has(v: YamlValue, path: Str) -> Bool
+    todo("yaml-nv.yamlkeys.has")
+
+// Whether a path resolves to the null node.
+//
+// `false` for a path that is not there at all — the two are different
+// and this function is the one that tells them apart, which is why it
+// exists rather than being folded into `has`.  `a:` in a config file
+// is a person blanking a setting on purpose, and a program that
+// treated it as absent would apply the default they were overriding.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("a:\n", yamlsafe.standard())!
+//     println("${yamlkeys.is_null_at(doc, "a")}")    // true
+//     println("${yamlkeys.is_null_at(doc, "b")}")    // false — b is absent
+// ```
+pub fn is_null_at(v: YamlValue, path: Str) -> Bool
+    todo("yaml-nv.yamlkeys.is_null_at")
+
+// One key of one mapping, with no path walking and no digit
+// interpretation.
+//
+// The primitive `get` is written in terms of, and the call for a
+// caller whose key contains a dot or is all digits.  It matches
+// STRING keys only.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("\"a.b\": 1\n", yamlsafe.standard())!
+//     match yamlkeys.child(doc, "a.b")
+//         Some(_) => println("found the literal key")
+//         None    => println("no")
+// ```
+pub fn child(v: YamlValue, key: Str) -> ?YamlValue
+    todo("yaml-nv.yamlkeys.child")
+
+// One item of a sequence, by 0-based index.
+//
+// `None` past the end, `None` for a negative index, and `None` for a
+// node that is not a sequence — three absences a caller indexing a
+// list handles the same way.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("a: [10, 20]\n", yamlsafe.standard())!
+//     match yamlkeys.at(yamlkeys.get(doc, "a")!, 1)
+//         Some(_) => println("20 is there")
+//         None    => println("no")
+// ```
+pub fn at(v: YamlValue, index: Int) -> ?YamlValue
+    todo("yaml-nv.yamlkeys.at")
+
+// A path split into its segments.
+//
+// A malformed path — an empty segment, an unclosed quote — is
+// `BadTag`'s sibling `NoSuchKey` with the path as written, because
+// there is no document position to give and the fault is in the
+// caller's string.
+//
+// ```novo
+// use yamlkeys
+//
+// fn main() [io]
+//     println("${list.len(yamlkeys.path_segments("a.b.0")!)}")   // 3
+// ```
+pub fn path_segments(path: Str) -> Result<[Str], YamlError>
+    todo("yaml-nv.yamlkeys.path_segments")
+
+// Segments joined back into a path.
+//
+// The inverse of `path_segments`, and the function an error message
+// uses to name where it was.
+//
+// ```novo
+// use yamlkeys
+//
+// fn main() [io]
+//     println(yamlkeys.path_of(["spec", "replicas"]))   // spec.replicas
+// ```
+pub fn path_of(segments: [Str]) -> Str
+    todo("yaml-nv.yamlkeys.path_of")
+
+// Every leaf path in a document, depth first, in document order.
+//
+// Sequence items appear with their index as a segment, so the output
+// is a list of paths `get` accepts.  It is what a `--dump` flag
+// prints, what a schema check walks, and what a diff between two
+// manifests compares.
+//
+// A path under a mapping key that is NOT a string is omitted, because
+// no string path names it — `yamlnode.pairs_of` is where those live,
+// and a caller that has them knows it does.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("a: [1, 2]\n", yamlsafe.standard())!
+//     println(list.join(yamlkeys.paths(doc), " "))   // a.0 a.1
+// ```
+pub fn paths(v: YamlValue) -> [Str]
+    todo("yaml-nv.yamlkeys.paths")
+
+// The string at a path, or why not.
+//
+// The value is NOT coerced: a `port: 8080` read as a string is a
+// mistake in the caller or the file, and returning `"8080"` would hide
+// which.  A quoted `"8080"` in the document IS a string and answers.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("db:\n  host: localhost\n", yamlsafe.standard())!
+//     println(yamlkeys.str_at(doc, "db.host")!)      // localhost
+// ```
+pub fn str_at(v: YamlValue, path: Str) -> Result<Str, YamlError>
+    todo("yaml-nv.yamlkeys.str_at")
+
+// The integer at a path, or why not.
+//
+// A `YamlFloat` is `WrongKind` even when integral: `1.0` and `1`
+// resolve differently under the core schema and a document that wrote
+// the first meant the first.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("replicas: 3\n", yamlsafe.standard())!
+//     println("${yamlkeys.int_at(doc, "replicas")!}")   // 3
+// ```
+pub fn int_at(v: YamlValue, path: Str) -> Result<Int, YamlError>
+    todo("yaml-nv.yamlkeys.int_at")
+
+// The float at a path, or why not.
+//
+// A `YamlInt` IS accepted here and widened — the one asymmetry in this
+// module, and the same one toml-nv makes: `timeout: 30` in a field
+// documented as seconds-with-fractions is a person writing a round
+// number, not a type error.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("timeout: 30\n", yamlsafe.standard())!
+//     println("${yamlkeys.float_at(doc, "timeout")!}")   // 30
+// ```
+pub fn float_at(v: YamlValue, path: Str) -> Result<Float, YamlError>
+    todo("yaml-nv.yamlkeys.float_at")
+
+// The boolean at a path, or why not.
+//
+// Under `SchemaCore`, `yes` and `on` are STRINGS and reach here as
+// `WrongKind` — which is the Norway problem showing up as an honest
+// error instead of as a silently wrong value.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("debug: true\n", yamlsafe.standard())!
+//     println("${yamlkeys.bool_at(doc, "debug")!}")      // true
+// ```
+pub fn bool_at(v: YamlValue, path: Str) -> Result<Bool, YamlError>
+    todo("yaml-nv.yamlkeys.bool_at")
+
+// The sequence at a path, as its items.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("ports: [80, 443]\n", yamlsafe.standard())!
+//     println("${list.len(yamlkeys.seq_at(doc, "ports")!)}")   // 2
+// ```
+pub fn seq_at(v: YamlValue, path: Str) -> Result<[YamlValue], YamlError>
+    todo("yaml-nv.yamlkeys.seq_at")
+
+// The mapping at a path, as its pairs in document order.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("db:\n  port: 5432\n", yamlsafe.standard())!
+//     println("${list.len(yamlkeys.map_at(doc, "db")!)}")      // 1
+// ```
+pub fn map_at(v: YamlValue, path: Str) -> Result<[YamlPair], YamlError>
+    todo("yaml-nv.yamlkeys.map_at")
+
+// A mapping's string keys, in document order.
+//
+// Non-string keys are omitted, so this is the list a caller that only
+// handles string-keyed mappings can iterate safely.  A caller that
+// needs the rest uses `yamlnode.pairs_of`.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("a: 1\nb: 2\n", yamlsafe.standard())!
+//     println("${list.len(yamlkeys.str_keys(doc))}")   // 2
+// ```
+pub fn str_keys(v: YamlValue) -> [Str]
+    todo("yaml-nv.yamlkeys.str_keys")
+
+// A pair's key as a string, or `None` when it is not one.
+//
+// The shortcut for the ninety-nine per cent of mappings whose keys are
+// strings, so a caller walking `yamlnode.pairs_of` does not have to
+// match `YamlStr` by hand at every step.
+//
+// ```novo
+// use yamlkeys
+// use yamlnode
+//
+// fn main() [io]
+//     let p = YamlPair { key: YamlStr("a"), value: YamlInt(1) }
+//     println(yamlkeys.str_key_of(p) ?? "«not a string key»")   // a
+// ```
+pub fn str_key_of(p: YamlPair) -> ?Str
+    todo("yaml-nv.yamlkeys.str_key_of")
+
+// The string at a path, or `None`.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("db: {}\n", yamlsafe.standard())!
+//     println(yamlkeys.opt_str(doc, "db.host") ?? "127.0.0.1")
+// ```
+pub fn opt_str(v: YamlValue, path: Str) -> ?Str
+    todo("yaml-nv.yamlkeys.opt_str")
+
+// The integer at a path, or `None`.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("spec: {}\n", yamlsafe.standard())!
+//     println("${yamlkeys.opt_int(doc, "spec.replicas") ?? 1}")
+// ```
+pub fn opt_int(v: YamlValue, path: Str) -> ?Int
+    todo("yaml-nv.yamlkeys.opt_int")
+
+// The float at a path, or `None`.  Widens an integer, as `float_at`
+// does.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("timeout: 30\n", yamlsafe.standard())!
+//     println("${yamlkeys.opt_float(doc, "timeout") ?? 5.0}")
+// ```
+pub fn opt_float(v: YamlValue, path: Str) -> ?Float
+    todo("yaml-nv.yamlkeys.opt_float")
+
+// The boolean at a path, or `None`.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("log: {}\n", yamlsafe.standard())!
+//     println("${yamlkeys.opt_bool(doc, "log.debug") ?? false}")
+// ```
+pub fn opt_bool(v: YamlValue, path: Str) -> ?Bool
+    todo("yaml-nv.yamlkeys.opt_bool")
+
+// A copy of the document with the node at a path replaced or added.
+//
+// A NEW tree: `[mutate]` is a host effect and this package has none.
+// Missing intermediate mappings are created, in the order the path
+// names them, and appended at the end of their parent.  A path whose
+// intermediate segment resolves to a NON-collection is `WrongKind`
+// rather than an overwrite, because silently replacing `a: 1` when
+// told to set `a.b` is how a configuration loses a setting.
+//
+// A numeric segment past the end of a sequence APPENDS rather than
+// padding with nulls: `containers.9` on a one-item list adds a second
+// item.  Padding would put nodes in a manifest nobody wrote.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+// use yamlnode
+//
+// fn main() [io]
+//     let doc = yamlread.parse("spec:\n  replicas: 1\n", yamlsafe.standard())!
+//     let next = yamlkeys.set(doc, "spec.replicas", YamlInt(3))!
+//     println("${yamlkeys.int_at(next, "spec.replicas")!}")   // 3
+// ```
+pub fn set(v: YamlValue, path: Str, value: YamlValue) -> Result<YamlValue, YamlError>
+    todo("yaml-nv.yamlkeys.set")
+
+// A copy of the document with the node at a path removed.
+//
+// `NoSuchKey` when it was not there — a remove that silently succeeds
+// on a typo never tells you about the typo.  Removing a sequence item
+// shifts the ones after it down, which is what a caller deleting a
+// container from a pod spec means; empty collections left behind are
+// left behind.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let doc = yamlread.parse("a: [1, 2]\n", yamlsafe.standard())!
+//     println("${list.len(yamlkeys.seq_at(yamlkeys.remove(doc, "a.0")!, "a")!)}")
+// ```
+pub fn remove(v: YamlValue, path: Str) -> Result<YamlValue, YamlError>
+    todo("yaml-nv.yamlkeys.remove")
+
+// A copy of `base` with every leaf of `overlay` written over it.
+//
+// Mappings merge key by key; everything else replaces whole — a
+// sequence in `overlay` replaces the one in `base` rather than
+// appending, because "the user's list plus the default's" is a
+// decision the caller makes.  Keys only in `base` survive; keys only
+// in `overlay` are appended in `overlay`'s order.
+//
+// This is what a layered configuration is written with, and what a
+// Kustomize-shaped overlay is.  It is NOT YAML's own `<<` merge key,
+// which is a 1.1 feature this package does not resolve — a `<<` in a
+// document is an ordinary string key here, and doing the merge is
+// this function, at a call site, where a reader can see it happen.
+//
+// ```novo
+// use yamlread
+// use yamlsafe
+// use yamlkeys
+//
+// fn main() [io]
+//     let base = yamlread.parse("a: 1\nb: 2\n", yamlsafe.standard())!
+//     let over = yamlread.parse("b: 3\n", yamlsafe.standard())!
+//     let m = yamlkeys.merge(base, over)!
+//     println("${yamlkeys.int_at(m, "b")!}")    // 3
+//     println("${yamlkeys.int_at(m, "a")!}")    // 1
+// ```
+pub fn merge(base: YamlValue, overlay: YamlValue) -> Result<YamlValue, YamlError>
+    todo("yaml-nv.yamlkeys.merge")

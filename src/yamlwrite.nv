@@ -1,0 +1,284 @@
+// yamlwrite.nv — block style out, under a named line-width policy.
+//
+// A LIBRARY DOES NOT PRINT
+//
+// Every function here returns a `Str` or `Bytes`.  Nothing opens a
+// file and nothing writes to a console: `docs/publishing.md` § Design
+// is explicit that a library returns the text or takes the writer, and
+// this package has no effects with which to do otherwise even if it
+// wanted to.
+//
+// BLOCK STYLE, BECAUSE THAT IS WHAT YAML IS FOR
+//
+// A tree can be emitted as flow — `{a: 1, b: [2, 3]}` — and that is
+// valid YAML and also JSON, and if a caller wanted that they would use
+// a JSON writer.  People choose YAML because block style is the one
+// serialisation format a person can read down a page and edit in
+// place.  So the writer emits block style, and flow is available
+// per-node for the collections where it genuinely reads better: a
+// short list of scalars on one line.  `flow_threshold` is where that
+// line is drawn, and it is a COLUMN budget rather than an item count,
+// because what makes a list unreadable is its width.
+//
+// THE LINE-WIDTH POLICY IS A NAMED VALUE, NOT AN INTEGER
+//
+// `width` on its own would be ambiguous in a way that matters: does 80
+// mean "wrap at 80" or "never exceed 80"?  For YAML those are
+// different, because a long plain scalar CANNOT always be wrapped —
+// folding it changes the value unless it is folded at a space, and a
+// URL has no spaces.  So the policy is three named cases that say what
+// happens when a line will not fit, and a caller picks the behaviour
+// rather than a number whose meaning it has to guess:
+//
+//   `WidthUnlimited`     — never fold.  Round-trips exactly; a long
+//                          value is a long line.
+//   `WidthFold(n)`       — fold at a space before column n, and leave
+//                          the line long when there is no space.  The
+//                          readable default.
+//   `WidthQuoteFold(n)`  — as `WidthFold`, and where folding is not
+//                          possible switch the scalar to double-quoted
+//                          so it CAN be broken with escapes.  Honours
+//                          the width always, at the cost of quotes
+//                          nobody wrote.
+//
+// Three cases and not a flag because the third one changes the
+// spelling of a value to meet a formatting rule, and a caller should
+// have said yes to that.
+
+use yamlsafe
+
+// What the writer does when a line will not fit.
+//
+// ```novo
+// use yamlwrite
+//
+// fn main() [io]
+//     match yamlwrite.standard().width
+//         WidthFold(n) => println("${n}")       // 80
+//         _            => println("something else")
+// ```
+pub enum YamlWidth
+    // Never fold: a long value is a long line.  The policy for output
+    // that has to round-trip byte for byte through another reader.
+    WidthUnlimited
+    // Fold at a space before this column; leave the line long when
+    // there is no space to fold at.  Never changes a value's
+    // spelling.
+    WidthFold(columns: Int)
+    // Fold at a space before this column, and where that is
+    // impossible re-spell the scalar as double-quoted so it can be
+    // broken with escapes.  Honours the width always, and is the only
+    // policy here that changes how a value is written in order to
+    // meet a formatting rule.
+    WidthQuoteFold(columns: Int)
+
+// How a document is spelled.
+//
+// `standard()` is the shape a person would write by hand.
+//
+// ```novo
+// use yamlwrite
+//
+// fn main() [io]
+//     println("${yamlwrite.standard().indent}")   // 2
+// ```
+pub struct YamlStyle
+    // Spaces of indentation per level.  2 in the standard style,
+    // which is what almost every YAML document in the world uses.
+    indent: Int
+    // What to do when a line will not fit.
+    width: YamlWidth
+    // Emit a flow collection when its rendering fits in this many
+    // columns and holds only scalars.  `0` means always block.  A
+    // column budget rather than an item count, because width is what
+    // makes a line unreadable.
+    flow_threshold: Int
+    // Indent a sequence's `-` under its parent key rather than at the
+    // parent's own column.  `false` in the standard style, which is
+    // the spelling `kubectl`, Ansible and most hand-written documents
+    // use; `true` is what some emitters produce and some linters
+    // require.
+    indent_sequences: Bool
+    // Emit `---` before the first document.  `false` for a single
+    // document, and always emitted between documents in a stream
+    // whatever this says, because without it there is no stream.
+    explicit_start: Bool
+    // Emit `...` after the last document.  `false` in the standard
+    // style: it is optional in YAML and most readers of the output
+    // will never have seen one.
+    explicit_end: Bool
+
+// The style a person would write by hand: two-space indent, fold at
+// 80 columns, flow collections up to 60 columns, sequences at the
+// parent's column, no explicit start or end marker.
+//
+// ```novo
+// use yamlwrite
+// use yamlnode
+//
+// fn main() [io]
+//     let s = yamlwrite.standard()
+//     println("${s.indent}")                    // 2
+//     println("${s.flow_threshold}")            // 60
+// ```
+pub fn standard() -> YamlStyle
+    todo("yaml-nv.yamlwrite.standard")
+
+// The style for output that must round-trip exactly: never fold,
+// never flow, explicit start and end markers.
+//
+// For a document another program will read back and compare — a
+// golden file, a checksummed artefact, a `kubectl diff`.
+//
+// ```novo
+// use yamlwrite
+//
+// fn main() [io]
+//     println("${yamlwrite.exact().flow_threshold}")   // 0
+// ```
+pub fn exact() -> YamlStyle
+    todo("yaml-nv.yamlwrite.exact")
+
+// A style with the width policy replaced.
+//
+// ```novo
+// use yamlwrite
+//
+// fn main() [io]
+//     let s = yamlwrite.with_width(yamlwrite.standard(), WidthUnlimited)
+//     match s.width
+//         WidthUnlimited => println("never folds")
+//         _              => println("folds")
+// ```
+pub fn with_width(s: YamlStyle, w: YamlWidth) -> YamlStyle
+    todo("yaml-nv.yamlwrite.with_width")
+
+// A style with the indent replaced.
+//
+// ```novo
+// use yamlwrite
+//
+// fn main() [io]
+//     println("${yamlwrite.with_indent(yamlwrite.standard(), 4).indent}")   // 4
+// ```
+pub fn with_indent(s: YamlStyle, n: Int) -> YamlStyle
+    todo("yaml-nv.yamlwrite.with_indent")
+
+// Render one document.
+//
+// The result always ends in exactly one newline, whatever the tree
+// looked like, because a text file that does not is a text file every
+// tool complains about.
+//
+// `NotEmittable` when the tree holds something no YAML scalar can
+// carry, or a collection key under a style that forbids one.
+//
+// ```novo
+// use yamlwrite
+// use yamlnode
+//
+// fn main() [io]
+//     let doc = YamlMap(pairs: [
+//         YamlPair { key: YamlStr("port"), value: YamlInt(8080) }])
+//     print(yamlwrite.to_string(doc, yamlwrite.standard())!)   // port: 8080
+// ```
+pub fn to_string(v: YamlValue, style: YamlStyle) -> Result<Str, YamlError>
+    todo("yaml-nv.yamlwrite.to_string")
+
+// Render a multi-document stream, `---` between the documents.
+//
+// The separator is emitted between documents whatever `explicit_start`
+// says, because without it the output is not a stream and a reader
+// would see one document.  `explicit_start` decides only whether one
+// appears BEFORE the first.
+//
+// ```novo
+// use yamlwrite
+// use yamlnode
+//
+// fn main() [io]
+//     let s = yamlwrite.stream_to_string([YamlInt(1), YamlInt(2)],
+//                                        yamlwrite.standard())!
+//     println("${str.contains(s, "---")}")      // true
+// ```
+pub fn stream_to_string(docs: [YamlValue], style: YamlStyle) -> Result<Str, YamlError>
+    todo("yaml-nv.yamlwrite.stream_to_string")
+
+// Render one document as bytes, UTF-8.
+//
+// Here so that a caller writing to a socket or a file does not
+// convert a string it is about to convert back.
+//
+// ```novo
+// use yamlwrite
+// use yamlnode
+//
+// fn main() [io]
+//     let b = yamlwrite.to_bytes(YamlInt(1), yamlwrite.standard())!
+//     println("${bytes.len(b)}")
+// ```
+pub fn to_bytes(v: YamlValue, style: YamlStyle) -> Result<Bytes, YamlError>
+    todo("yaml-nv.yamlwrite.to_bytes")
+
+// Render ONE scalar as it would appear in a document, quoted if it has
+// to be.
+//
+// A string that would otherwise resolve to something else comes back
+// quoted — `"true"`, `"1.5"`, `"null"`, `"no"` — because that is the
+// only way a YAML document says "this is text".  This is the function
+// a round trip is correct or incorrect because of, and it is public so
+// that a caller assembling a line by hand gets the same answers the
+// writer does.
+//
+// ```novo
+// use yamlwrite
+// use yamlnode
+//
+// fn main() [io]
+//     println(yamlwrite.scalar_to_string(YamlStr("true")))   // "true"
+//     println(yamlwrite.scalar_to_string(YamlBool(true)))    // true
+// ```
+pub fn scalar_to_string(v: YamlValue) -> Str
+    todo("yaml-nv.yamlwrite.scalar_to_string")
+
+// Whether a string would need quoting to be written as a plain scalar.
+//
+// True when it would resolve to a non-string under the core schema,
+// when it starts with an indicator character, when it contains a `: `
+// or a ` #`, or when it is empty.  It is the rule
+// `scalar_to_string` applies, exposed so a caller producing a line
+// this package did not can apply the same one.
+//
+// ```novo
+// use yamlwrite
+//
+// fn main() [io]
+//     println("${yamlwrite.needs_quote("true")}")   // true
+//     println("${yamlwrite.needs_quote("hello")}")  // false
+// ```
+pub fn needs_quote(text: Str) -> Bool
+    todo("yaml-nv.yamlwrite.needs_quote")
+
+// Whether a tree can be written as a YAML document, and why not.
+//
+// `to_string` runs this first, so calling it separately is for a
+// caller that wants to fail early.  A tree that came out of
+// `yamlread.parse` always passes, which is what makes the round trip
+// total.
+//
+// It does NOT check the safety budgets — that is `yamlsafe.check`, and
+// they are separate because "can this be written" and "would a reader
+// with this policy accept it" are different questions with different
+// answers, and a caller emitting for a stricter reader asks both.
+//
+// ```novo
+// use yamlwrite
+// use yamlnode
+//
+// fn main() [io]
+//     match yamlwrite.check(YamlInt(1))
+//         Some(_) => println("not emittable")
+//         None    => println("writable")       // a scalar IS a document
+// ```
+pub fn check(v: YamlValue) -> ?YamlError
+    todo("yaml-nv.yamlwrite.check")
