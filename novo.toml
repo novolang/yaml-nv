@@ -1,6 +1,6 @@
 [package]
 name        = "yaml-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "The safe subset of YAML 1.2, read and written without performing anything: block and flow collections, the core schema's scalar resolution, anchors and aliases behind a budget that stops a billion-laughs document, multi-document streams, and an explicit refusal of the tags a safe loader must never honour.  A feed-and-drain reader over chunks, and a writer that emits block style under a named line-width policy."
 license     = "Apache-2.0"
 
