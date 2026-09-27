@@ -24,7 +24,6 @@
 
 use std.list
 use yamlnode
-use yamlerror
 
 // What this loader will and will not do with a document.
 //

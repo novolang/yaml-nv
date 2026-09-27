@@ -9,7 +9,6 @@
 // allows exactly those, since the suite is about the grammar and not
 // about which tags a loader honours.
 
-use yamlnode
 use yamlread
 use yamlsafe
 use yamlwrite

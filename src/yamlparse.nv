@@ -16,7 +16,6 @@
 use std.str
 use std.list
 use yamlnode
-use yamlerror
 use yamlsafe
 
 // Where a block node sits, which decides what may start it and how far

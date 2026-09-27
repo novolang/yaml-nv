@@ -25,7 +25,6 @@ use std.str
 use std.list
 use std.bytes
 use yamlnode
-use yamlerror
 
 // What the writer does when a line will not fit.
 //
