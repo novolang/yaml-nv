@@ -1,14 +1,9 @@
-// yamlread_tests.nv — the API suite for the reader and the writer.
+// yamlread_tests.nv — the reader and the writer.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// yaml-nv.<module>.<fn>`.  What is asserted is the feed-and-drain
-// contract, the position on every refusal, the safety refusals in
-// action, and the writer's round-trip law.
-//
-// The helpers below unwrap a fixture that is known good, once each, so
-// the cases read as the assertions they are.  A case whose SUBJECT is
-// a refusal always matches the `Result` in full — that is the
-// assertion, and a helper would swallow it.
+// The feed-and-drain contract, the position on every refusal, the
+// safety refusals in action, and the writer's round trip.  The helpers
+// unwrap a fixture that is known good; a case whose subject is a
+// refusal matches the `Result` in full.
 
 use std.test
 use yamlnode
@@ -51,9 +46,8 @@ fn billion_laughs() -> Str
 
 @test
 fn test_feed_hands_back_documents_as_the_stream_completes_them() [io]
-    // THE REASON THIS PACKAGE HAS A FEED-AND-DRAIN READER AND
-    // toml-nv DOES NOT: a YAML stream is a sequence of documents and
-    // each is complete at its terminator, so a chunk CAN complete one
+    // A YAML stream is a sequence of documents and
+    // each is complete at its terminator, so a chunk can complete one
     // while the rest of the stream is still arriving.
     test.case("a chunk completing one document yields one")
     let r = yamlread.reader(yamlsafe.standard())
@@ -107,7 +101,7 @@ fn test_a_failed_reader_stays_failed() [io]
 @test
 fn test_every_refusal_carries_a_line_and_a_column() [io]
     // YAML is whitespace-significant, so the mistakes people make in
-    // it are mistakes of COLUMN.  "mapping values are not allowed
+    // it are mistakes of column.  "mapping values are not allowed
     // here" without a position is the message every YAML user has seen
     // and none has been helped by.
     test.case("a tab where a space is required gets its own arm")
@@ -236,13 +230,11 @@ fn test_parse_refuses_a_multi_document_stream_and_parse_stream_takes_it() [io]
 
 @test
 fn test_read_all_is_charged_what_the_stream_costs_and_not_more() [io]
-    // THE ONE THING THIS SUITE PROVES BEFORE ANY BODY EXISTS.
-    // `read_all<S: Read[e]>` binds the trait's effect parameter and
-    // its clause is `[e]`; the standard library declares
-    // `impl Read[] for Buffer`, so at this call site `[e]` substitutes
-    // to nothing and this function's row stays `[io]`.  A signature
-    // that had SPENT `[io, fs]` would not compile here, which is the
-    // assertion, and the compiler makes it with every body a `todo()`.
+    // `read_all<S: Read[e]>` binds the trait's effect parameter and its
+    // clause is `[e]`; the standard library declares
+    // `impl Read[] for Buffer`, so at this call site `[e]` is nothing
+    // and this test's row stays `[io]`.  A signature that spent
+    // `[io, fs]` would not compile here.
     test.case("read_all over an in-memory Buffer")
     let src = Buffer.from_str("a: 1\n---\nb: 2\n")
     match yamlread.read_all(src, yamlsafe.standard())

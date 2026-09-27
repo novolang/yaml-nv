@@ -1,0 +1,473 @@
+// edges_tests.nv — the refusals, the schemas' rarer spellings, the
+// writer's policies and the reader's byte handling, one case each.
+//
+// The expected values are YAML 1.2.2's: the escapes of section 5.7, the
+// schemas of chapter 10, and the refusals the yaml-test-suite marks as
+// errors.
+
+use std.test
+use std.list
+use std.str
+use std.bytes
+use yamlnode
+use yamlerror
+use yamlsafe
+use yamlkeys
+use yamlread
+use yamlwrite
+
+fn std() -> YamlLimits
+    yamlsafe.standard()
+
+fn err_of(text: Str) -> Str
+    match yamlread.parse_stream(text, std())
+        Ok(_)  => "ok"
+        Err(e) => yamlerror.render(e, "t")
+
+fn value(text: Str) -> YamlValue
+    match yamlread.parse(text, std())
+        Ok(v)  => v
+        Err(e) => YamlStr("error: " + e.message())
+
+fn str_value(text: Str) -> Str
+    match value(text)
+        YamlStr(s) => s
+        v          => "not a string: " + yamlnode.kind_name(v)
+
+fn written(v: YamlValue, style: YamlStyle) -> Str
+    match yamlwrite.to_string(v, style)
+        Ok(s)  => s
+        Err(e) => "error: " + e.message()
+
+@test
+fn test_every_refusal_has_a_message_and_its_position() [io]
+    let errors = [BadIndent(1, 2, 3), TabInIndent(1, 2), UnexpectedMappingValue(1, 2, "x"),
+                  UnexpectedSequenceEntry(1, 2, "x"), UnterminatedFlow(1, 2),
+                  UnexpectedFlowClose(1, 2), UnterminatedQuote(1, 2), BadEscape(1, 2, "\\q"),
+                  BadBlockScalar(1, 2, "x"), DuplicateKey(1, 2, "k", 1), UnknownAnchor(1, 2, "a"),
+                  UnsafeTag(1, 2, "!x"), BadTag(1, 2, "!x"), BadDirective(1, 2, "%X"),
+                  TooDeep(1, 2, 3), AliasBudgetExceeded(1, 2, 3), AliasRepeatExceeded(1, 2, "a", 3),
+                  UnexpectedByte(1, 2, 255), ComplexKey(1, 2)]
+    test.case("each positioned refusal answers its line and column")
+    for e in errors
+        test.assert(yamlerror.line_of(e) == 1)
+        test.assert(yamlerror.col_of(e) == 2)
+        test.assert(str.len(e.message()) > 0)
+    test.assert(str.contains(UnexpectedByte(1, 2, 255).message(), "0xFF"))
+
+    test.case("the ones with no position answer -1")
+    let unplaced = [WrongKind("p", "int", "str"), NotEmittable("x"), Transport(IoBrokenPipe)]
+    for e in unplaced
+        test.assert(yamlerror.line_of(e) == -1)
+        test.assert(str.len(e.message()) > 0)
+
+@test
+fn test_the_schemas_rarer_spellings() [io]
+    test.case("the core schema's floats: exponents, a leading point, the infinities")
+    test.assert(yamlnode.equal(yamlnode.resolve("1e3", SchemaCore), YamlFloat(1000.0)))
+    test.assert(yamlnode.equal(yamlnode.resolve("-2.5E-1", SchemaCore), YamlFloat(-0.25)))
+    test.assert(yamlnode.equal(yamlnode.resolve(".5", SchemaCore), YamlFloat(0.5)))
+    test.assert(yamlnode.equal(yamlnode.resolve("+1.", SchemaCore), YamlFloat(1.0)))
+    test.assert(yamlnode.kind_name(yamlnode.resolve("1e", SchemaCore)) == "str")
+    test.assert(yamlnode.kind_name(yamlnode.resolve("1.5x", SchemaCore)) == "str")
+    test.assert(yamlnode.kind_name(yamlnode.resolve(".", SchemaCore)) == "str")
+    match yamlnode.resolve("-.inf", SchemaCore)
+        YamlFloat(f) => test.assert(f < -1.0e308)
+        _            => test.fail("-.inf is negative infinity")
+
+    test.case("the most negative integer, and one past it")
+    test.assert(yamlnode.equal(yamlnode.resolve("-9223372036854775808", SchemaCore),
+                               YamlInt(-9223372036854775807 - 1)))
+    test.assert(yamlnode.kind_name(yamlnode.resolve("9223372036854775808", SchemaCore)) == "str")
+    test.assert(yamlnode.kind_name(yamlnode.resolve("0o", SchemaCore)) == "str")
+    test.assert(yamlnode.kind_name(yamlnode.resolve("0x1G", SchemaCore)) == "str")
+
+    test.case("the JSON schema: its own spellings and nothing else")
+    test.assert(yamlnode.equal(yamlnode.resolve("true", SchemaJson), YamlBool(true)))
+    test.assert(yamlnode.equal(yamlnode.resolve("false", SchemaJson), YamlBool(false)))
+    test.assert(yamlnode.equal(yamlnode.resolve("-12", SchemaJson), YamlInt(-12)))
+    test.assert(yamlnode.equal(yamlnode.resolve("1.5e2", SchemaJson), YamlFloat(150.0)))
+    test.assert(yamlnode.kind_name(yamlnode.resolve("012", SchemaJson)) == "str")
+    test.assert(yamlnode.kind_name(yamlnode.resolve("+1", SchemaJson)) == "str")
+    test.assert(yamlnode.kind_name(yamlnode.resolve("1.", SchemaJson)) == "str")
+    test.assert(yamlnode.kind_name(yamlnode.resolve("abc", SchemaJson)) == "str")
+
+    test.case("YAML 1.1: booleans, underscores, binary, octal, hex and base 60")
+    test.assert(yamlnode.equal(yamlnode.resolve("~", SchemaLegacy11), YamlNull))
+    test.assert(yamlnode.equal(yamlnode.resolve("on", SchemaLegacy11), YamlBool(true)))
+    test.assert(yamlnode.equal(yamlnode.resolve("1_000", SchemaLegacy11), YamlInt(1000)))
+    test.assert(yamlnode.equal(yamlnode.resolve("0b101", SchemaLegacy11), YamlInt(5)))
+    test.assert(yamlnode.equal(yamlnode.resolve("017", SchemaLegacy11), YamlInt(15)))
+    test.assert(yamlnode.equal(yamlnode.resolve("-0x1f", SchemaLegacy11), YamlInt(-31)))
+    test.assert(yamlnode.equal(yamlnode.resolve("1:30", SchemaLegacy11), YamlInt(90)))
+    test.assert(yamlnode.equal(yamlnode.resolve("-1:30", SchemaLegacy11), YamlInt(-90)))
+    test.assert(yamlnode.equal(yamlnode.resolve("1_0.5", SchemaLegacy11), YamlFloat(10.5)))
+    test.assert(yamlnode.kind_name(yamlnode.resolve(".inf", SchemaLegacy11)) == "float")
+    test.assert(yamlnode.kind_name(yamlnode.resolve("1:70", SchemaLegacy11)) == "str")
+    test.assert(yamlnode.kind_name(yamlnode.resolve("1:x", SchemaLegacy11)) == "str")
+    test.assert(yamlnode.kind_name(yamlnode.resolve("hello", SchemaLegacy11)) == "str")
+
+@test
+fn test_equality_and_depth_across_kinds() [io]
+    let all = [YamlMap([]), YamlSeq([]), YamlStr("a"), YamlInt(1), YamlFloat(1.5), YamlBool(true),
+               YamlNull]
+    test.case("no node equals a node of another kind")
+    for i in 0..list.len(all)
+        for j in 0..list.len(all)
+            test.assert(yamlnode.equal(all[i], all[j]) == (i == j))
+
+    test.case("two NaNs are equal, and maps and sequences compare by contents")
+    test.assert(yamlnode.equal(YamlFloat(0.0 / 0.0), YamlFloat(0.0 / 0.0)))
+    test.assert(not yamlnode.equal(YamlSeq([YamlInt(1)]), YamlSeq([YamlInt(2)])))
+    test.assert(not yamlnode.equal(YamlSeq([YamlInt(1)]), YamlSeq([])))
+    test.assert(not yamlnode.equal(YamlMap([YamlPair { key: YamlInt(1), value: YamlNull }]), YamlMap([])))
+
+    test.case("depth takes the deepest branch, keys included")
+    let deep = YamlMap([YamlPair { key: YamlStr("a"), value: YamlInt(1) },
+                        YamlPair { key: YamlStr("b"), value: YamlSeq([YamlSeq([])]) }])
+    test.assert(yamlnode.depth(deep) == 3)
+    test.assert(yamlnode.node_count(deep) == 6)
+
+@test
+fn test_scalars_in_every_style() [io]
+    test.case("double-quoted escapes, section 5.7")
+    test.assert(str_value("\"\\0\\a\\b\\t\\n\\v\\f\\r\\e\\ \\\"\\/\\\\\"") == "\u{0}\u{7}\u{8}\t\n\u{b}\u{c}\r\u{1b} \"/\\")
+    test.assert(str_value("\"\\N\\_\\L\\P\"") == "\u{85}\u{a0}\u{2028}\u{2029}")
+    test.assert(str_value("\"\\x41\\u00e9\\U0001F600\"") == "Aé\u{1F600}")
+    test.assert(str_value("\"a\\\n   b\"") == "ab")
+    test.assert(str_value("\"tab\\\tx\"") == "tab\tx")
+
+    test.case("a bad escape names itself")
+    test.assert(err_of("\"\\q\"") == "t:1:2: the escape \\q is not one YAML defines")
+    test.assert(str.contains(err_of("\"\\x4G\""), "\\x4G"))
+    test.assert(str.contains(err_of("\"\\uD800\""), "\\uD800"))
+
+    test.case("single-quoted, with the doubled quote and folding")
+    test.assert(str_value("'it''s\n\n  here'") == "it's\nhere")
+
+    test.case("quotes that never close, and one past the scalar bound")
+    test.assert(str.starts_with(err_of("a: 'open"), "t:1:4: a quoted scalar"))
+    let tight = YamlLimits { max_depth: 8, max_nodes: 100, max_alias_uses: 4, max_scalar_bytes: 3,
+                             allowed_tags: [], allow_aliases: true, allow_complex_keys: false }
+    match yamlread.parse("\"abcdef\"", tight)
+        Err(UnterminatedQuote(_, _)) => test.assert(true)
+        _                            => test.fail("a quoted scalar past the bound is refused")
+    match yamlread.parse("abcdef", tight)
+        Err(BadBlockScalar(_, _, _)) => test.assert(true)
+        _                            => test.fail("a plain scalar past the bound is refused")
+    match yamlread.parse("|\n  abcdef\n", tight)
+        Err(BadBlockScalar(_, _, _)) => test.assert(true)
+        _                            => test.fail("a block scalar past the bound is refused")
+
+    test.case("block scalars: chomping, indentation indicators, folding")
+    test.assert(str_value("|-\n  a\n  b\n\n") == "a\nb")
+    test.assert(str_value("|+\n  a\n\n") == "a\n\n")
+    test.assert(str_value("|+\n\n") == "\n")
+    test.assert(str_value("|\n") == "")
+    test.assert(yamlkeys.str_at(value("a: |2\n    x\n"), "a")! == "  x\n")
+    test.assert(str_value(">\n  a\n  b\n\n  c\n   d\n  e\n") == "a b\nc\n d\ne\n")
+    test.assert(str_value("--- |\n  x") == "x\n")
+    test.assert(str.contains(err_of("a: |x\n  b\n"), "header"))
+    test.assert(str.contains(err_of("a: |\n     \n  b\n"), "leading empty line"))
+
+    test.case("a lone carriage return in a quoted scalar is a line break, and a block scalar at the end")
+    test.assert(str_value("\"a\rb\"") == "a b")
+    test.assert(yamlkeys.str_at(value("a: |"), "a")! == "")
+
+    test.case("a tab after too few spaces ends a block scalar")
+    test.assert(err_of("a: |\n  x\n \tfoo\n") != "ok")
+
+    test.case("an empty key, in block and in flow")
+    test.assert(yamlnode.equal(value(": a\n"), YamlMap([YamlPair { key: YamlNull, value: YamlStr("a") }])))
+    test.assert(yamlnode.equal(value("{: a}"), YamlMap([YamlPair { key: YamlNull, value: YamlStr("a") }])))
+
+    test.case("a plain scalar that runs into a mapping value on its next line")
+    test.assert(str.contains(err_of("a\n  |x: y\n"), "a plain scalar"))
+
+@test
+fn test_tags_and_anchors_at_their_edges() [io]
+    test.case("core tags force their type, and refuse a value that is not one")
+    test.assert(yamlnode.equal(value("!!float 1"), YamlFloat(1.0)))
+    test.assert(yamlnode.equal(value("!!null ''"), YamlNull))
+    test.assert(yamlnode.equal(value("! 12"), YamlStr("12")))
+    test.assert(yamlnode.equal(value("!!int \"7\""), YamlInt(7)))
+    test.assert(str.contains(err_of("!!int x"), "!!int"))
+    test.assert(str.contains(err_of("!!map [a]"), "!!map"))
+
+    test.case("a verbatim tag with no closing bracket, and an empty anchor")
+    test.assert(str.contains(err_of("!<tag:yaml.org,2002:str x"), "!<tag:yaml.org,2002:str"))
+    test.assert(str.contains(err_of("& x"), "&"))
+
+    test.case("a named handle that no %TAG declared, and one that was")
+    test.assert(str.contains(err_of("!e!x a"), "!e!x"))
+    let ok = yamlsafe.allowing(std(), ["!e!x"])
+    match yamlread.parse("%TAG !e! tag:example.com,2000:\n---\n!e!x a\n", ok)
+        Ok(v)  => test.assert(yamlnode.equal(v, YamlStr("a")))
+        Err(_) => test.fail("the handle was declared")
+
+    test.case("an alias may not carry properties, and aliases may be turned off")
+    test.assert(str.contains(err_of("a: &x 1\nb: &y *x\n"), "*"))
+    match yamlread.parse("a: &x 1\nb: *x\n", yamlsafe.hardened())
+        Err(AliasRepeatExceeded(_, _, n, l)) =>
+            test.assert(n == "x")
+            test.assert(l == 0)
+        _                                    => test.fail("hardened() refuses every alias")
+
+    test.case("the depth bound refuses nesting past it")
+    match yamlread.parse("[[[1]]]", yamlsafe.with_max_depth(std(), 2))
+        Err(TooDeep(_, _, l)) => test.assert(l == 2)
+        _                     => test.fail("three levels do not fit a depth of two")
+
+    test.case("a collection key is refused unless the policy allows one")
+    match yamlread.parse("? [a]\n: 1\n", std())
+        Err(ComplexKey(l, _)) => test.assert(l == 1)
+        _                     => test.fail("a sequence key is refused by default")
+    match yamlread.parse("[a]: 1\n", yamlsafe.with_complex_keys(std(), true))
+        Ok(v)  => test.assert(yamlnode.len(v) == 1)
+        Err(_) => test.fail("allowed by the policy")
+
+    test.case("a duplicate key of every scalar kind names itself")
+    test.assert(str.contains(err_of("1: a\n1: b\n"), "key 1 "))
+    test.assert(str.contains(err_of("true: a\ntrue: b\n"), "key true "))
+    test.assert(str.contains(err_of("1.5: a\n1.5: b\n"), "key 1.5"))
+    test.assert(str.contains(err_of("~: a\n~: b\n"), "key null "))
+    match yamlread.parse("{[a]: 1, [a]: 2}", yamlsafe.with_complex_keys(std(), true))
+        Err(DuplicateKey(_, _, k, _)) => test.assert(k == "seq")
+        _                             => test.fail("the same sequence key twice")
+
+@test
+fn test_block_structure_refusals() [io]
+    test.case("a sequence entry where a mapping continues")
+    test.assert(str.contains(err_of("a: 1\n- b\n"), "a sequence entry"))
+
+    test.case("a mapping or a sequence on its key's line")
+    test.assert(str.contains(err_of("a: b: c\n"), "on its key's line"))
+    test.assert(str.contains(err_of("a: - b\n"), "on its key's line"))
+
+    test.case("a line that is neither a key nor an entry inside a mapping")
+    test.assert(str.contains(err_of("a: 1\nb\n"), "without a key"))
+
+    test.case("flow collections that are not closed or close the wrong kind")
+    test.assert(err_of("[a, b") == "t:1:1: a flow collection that is never closed")
+    test.assert(str.contains(err_of("[a}"), "closing bracket"))
+    test.assert(str.contains(err_of("{a: [b}"), "closing bracket"))
+    test.assert(str.contains(err_of("[a b c"), "never closed"))
+
+    test.case("a flow mapping entry with no value, and explicit keys in flow")
+    test.assert(yamlnode.equal(value("{a, ? b}"),
+                               YamlMap([YamlPair { key: YamlStr("a"), value: YamlNull },
+                                        YamlPair { key: YamlStr("b"), value: YamlNull }])))
+    test.assert(yamlnode.equal(value("[? a : b]"),
+                               YamlSeq([YamlMap([YamlPair { key: YamlStr("a"), value: YamlStr("b") }])])))
+
+@test
+fn test_the_reader_at_the_byte_level() [io]
+    test.case("feed takes bytes, and a UTF-8 sequence may be split between chunks")
+    let r = yamlread.reader(std())
+    let e = bytes.to_byte_list(bytes.from_str("a: é\n"))
+    let first = yamlread.feed(r, bytes.from_byte_list(e[0:4]))
+    let second = yamlread.feed(first.0, bytes.from_byte_list(e[4:list.len(e)]))
+    match yamlread.finish(second.0)
+        Ok(docs) => test.assert(yamlkeys.str_at(docs[0], "a")! == "é")
+        Err(_)   => test.fail("the split sequence was joined")
+
+    test.case("a lone continuation byte is refused")
+    match yamlread.parse_bytes(bytes.from_byte_list([0x82]), std())
+        Err(UnexpectedByte(_, _, b)) => test.assert(b == 0x82)
+        _                            => test.fail("a continuation byte starts nothing")
+
+    test.case("a stream that ends inside a UTF-8 sequence is refused at finish")
+    let cut = yamlread.feed(yamlread.reader(std()), bytes.from_byte_list([97, 10, 0xC3]))
+    match yamlread.finish(cut.0)
+        Err(UnexpectedByte(l, _, b)) =>
+            test.assert(l == 2)
+            test.assert(b == 0xC3)
+        _                            => test.fail("half a character is not text")
+
+    test.case("a zero byte, a bad lead and a bad continuation are each refused where they are")
+    match yamlread.parse_bytes(bytes.from_byte_list([97, 10, 98, 0]), std())
+        Err(UnexpectedByte(l, c, _)) =>
+            test.assert(l == 2)
+            test.assert(c == 2)
+        _                            => test.fail("a zero byte is not YAML text")
+    match yamlread.parse_bytes(bytes.from_byte_list([0xF8, 97]), std())
+        Err(UnexpectedByte(_, _, b)) => test.assert(b == 0xF8)
+        _                            => test.fail("0xF8 starts no sequence")
+    match yamlread.parse_bytes(bytes.from_byte_list([0xE2, 0x82, 97]), std())
+        Err(UnexpectedByte(_, _, b)) => test.assert(b == 0xE2)
+        _                            => test.fail("the sequence is cut short")
+    match yamlread.parse_bytes(bytes.from_byte_list([0xF0, 0x9F, 0x98, 0x80, 10]), std())
+        Ok(docs) => test.assert(list.len(docs) == 1)
+        Err(_)   => test.fail("a four-byte sequence is text")
+
+    test.case("a failed reader ignores later bytes, and finish reports the failure")
+    let bad = yamlread.feed(yamlread.reader(std()), bytes.from_byte_list([0]))
+    let after = yamlread.feed(bad.0, bytes.from_str("a: 1\n"))
+    test.assert(list.len(after.1) == 0)
+    match yamlread.finish(after.0)
+        Err(_) => test.assert(true)
+        Ok(_)  => test.fail("the reader failed on the zero byte")
+
+    test.case("an unclosed quote in a partial document waits for the next chunk")
+    let open = yamlread.feed_str(yamlread.reader(std()), "a: \"one\n")
+    test.assert(yamlread.error(open.0) == None)
+    let closed = yamlread.feed_str(open.0, "  two\"\n")
+    match yamlread.finish(closed.0)
+        Ok(docs) => test.assert(yamlkeys.str_at(docs[0], "a")! == "one two")
+        Err(_)   => test.fail("the quote closed in the second chunk")
+    let bracket = yamlread.feed_str(yamlread.reader(std()), "a: [1,\n")
+    test.assert(yamlread.error(bracket.0) == None)
+
+    test.case("carriage-return line endings, and an empty document is null")
+    test.assert(yamlkeys.int_at(value("a: 1\r\nb: 2\r\n"), "b")! == 2)
+    test.assert(yamlnode.equal(value(""), YamlNull))
+    test.assert(yamlnode.equal(value("# only a comment\n"), YamlNull))
+
+@test
+fn test_directives_and_markers() [io]
+    test.case("a %YAML directive for 1.x is read, and one for 2.0 refused")
+    test.assert(yamlnode.equal(value("%YAML 1.2\n---\na\n"), YamlStr("a")))
+    test.assert(str.contains(err_of("%YAML 2.0\n---\na\n"), "%YAML 2.0"))
+    test.assert(str.contains(err_of("%YAML 1.2\n%YAML 1.2\n---\na\n"), "%YAML 1.2"))
+    test.assert(str.contains(err_of("%TAG !x\n---\na\n"), "%TAG"))
+
+    test.case("a reserved directive is ignored, as section 6.8.1 says")
+    test.assert(yamlnode.equal(value("%FOO bar\n---\na\n"), YamlStr("a")))
+
+    test.case("a directive needs a document after its ---")
+    test.assert(str.contains(err_of("%YAML 1.2\na\n"), "%YAML"))
+    test.assert(str.contains(err_of("%YAML 1.2\n...\n"), "%YAML"))
+    test.assert(str.contains(err_of("%YAML 1.2\n"), "%YAML"))
+
+    test.case("text after a ... marker is refused, and a comment after it is not")
+    test.assert(str.contains(err_of("a\n... b\n"), "0x62"))
+    test.assert(err_of("a\n... # end\n") == "ok")
+
+    test.case("a block collection may not start on the --- line")
+    test.assert(str.contains(err_of("--- a: 1\n"), "the `---` line"))
+    test.assert(err_of("--- [a]\n") == "ok")
+
+@test
+fn test_the_writer_under_each_policy() [io]
+    let long = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen"
+    let doc = YamlMap([YamlPair { key: YamlStr("text"), value: YamlStr(long) }])
+
+    test.case("WidthFold folds a long plain scalar at single spaces, and it reads back")
+    let folded = written(doc, yamlwrite.standard())
+    test.assert(str.contains(folded, "\n  "))
+    test.assert(yamlnode.equal(value(folded), doc))
+
+    test.case("WidthUnlimited never folds")
+    test.assert(not str.contains(written(doc, yamlwrite.exact()), "\n  "))
+
+    test.case("a scalar with no single space to fold at stays long under WidthFold")
+    let url = YamlMap([YamlPair { key: YamlStr("u"), value: YamlStr(str.repeat("x", 100)) }])
+    test.assert(str.len(written(url, yamlwrite.standard())) > 100)
+    let doubled = YamlMap([YamlPair { key: YamlStr("d"), value: YamlStr(str.repeat("ab  ", 30) + "z") }])
+    test.assert(yamlnode.equal(value(written(doubled, yamlwrite.standard())), doubled))
+
+    test.case("WidthQuoteFold breaks it inside double quotes, and it reads back")
+    let q = yamlwrite.with_width(yamlwrite.standard(), WidthQuoteFold(40))
+    let broken = written(url, q)
+    test.assert(str.contains(broken, "\\\n"))
+    test.assert(yamlnode.equal(value(broken), url))
+    let escaped = YamlMap([YamlPair { key: YamlStr("e"), value: YamlStr(str.repeat("a\u{1}", 30)) }])
+    test.assert(yamlnode.equal(value(written(escaped, q)), escaped))
+    test.assert(yamlnode.equal(value(written(doc, q)), doc))
+
+    test.case("explicit markers, the stream separator and a flow sequence")
+    let ex = written(YamlSeq([YamlInt(1), YamlStr("a,b")]), yamlwrite.exact())
+    test.assert(ex == "---\n- 1\n- a,b\n...\n")
+    let flow = YamlMap([YamlPair { key: YamlStr("f"), value: YamlSeq([YamlInt(1), YamlStr("a,b")]) }])
+    test.assert(written(flow, yamlwrite.standard()) == "f: [1, \"a,b\"]\n")
+    test.assert(yamlwrite.stream_to_string([YamlInt(1), YamlSeq([YamlMap([])])], yamlwrite.standard())!
+                == "1\n---\n- {}\n")
+
+    test.case("the special floats, a collection as a scalar, and an empty collection")
+    test.assert(yamlwrite.scalar_to_string(YamlFloat(0.0 / 0.0)) == ".nan")
+    test.assert(yamlwrite.scalar_to_string(YamlFloat(1.0 / 0.0)) == ".inf")
+    test.assert(yamlwrite.scalar_to_string(YamlFloat(-1.0 / 0.0)) == "-.inf")
+    test.assert(yamlwrite.scalar_to_string(YamlFloat(2.0)) == "2.0")
+    let m = YamlMap([YamlPair { key: YamlStr("a"), value: YamlSeq([YamlInt(1)]) }])
+    test.assert(yamlwrite.scalar_to_string(m) == "{a: [1]}")
+    test.assert(yamlwrite.scalar_to_string(YamlSeq([m])) == "[{a: [1]}]")
+    test.assert(written(YamlMap([]), yamlwrite.standard()) == "{}\n")
+    test.assert(written(YamlSeq([]), yamlwrite.standard()) == "[]\n")
+
+    test.case("nested collections in block style, and a sequence indented under its key")
+    let nested = YamlSeq([YamlSeq([YamlMap([YamlPair { key: YamlStr("k"),
+                                                       value: YamlSeq([YamlMap([]), YamlSeq([YamlInt(1), YamlSeq([])])]) }])])])
+    test.assert(yamlnode.equal(value(written(nested, yamlwrite.exact())), nested))
+    let under = YamlStyle { indent: 2, width: WidthUnlimited, flow_threshold: 0,
+                            indent_sequences: true, explicit_start: false, explicit_end: false }
+    test.assert(written(m, under) == "a:\n  - 1\n")
+
+    test.case("strings of several lines: literal where it can be, quoted where not")
+    let lines = YamlSeq([YamlStr("a\nb"), YamlStr("a\n\nb\n\n"), YamlStr(" lead\nx"),
+                         YamlStr("ctl\u{7}\nx"), YamlStr("\n\n")])
+    test.assert(yamlnode.equal(value(written(lines, yamlwrite.exact())), lines))
+    let key = YamlMap([YamlPair { key: YamlStr("two\nlines"), value: YamlInt(1) }])
+    test.assert(yamlnode.equal(value(written(key, yamlwrite.exact())), key))
+
+    test.case("a string that looks like something else is quoted")
+    for t in ["- a", ": b", "#c", "---x", "a: b", "a #b", "end:", " pad", "x\ty", "?", "@x", "a\u{7f}"]
+        test.assert(yamlwrite.needs_quote(t))
+        test.assert(yamlnode.equal(value(yamlwrite.scalar_to_string(YamlStr(t))), YamlStr(t)))
+    test.assert(not yamlwrite.needs_quote("-x"))
+
+    test.case("a collection key cannot be written, anywhere in the tree")
+    let complex = YamlSeq([YamlMap([YamlPair { key: YamlSeq([]), value: YamlNull }])])
+    match yamlwrite.to_string(complex, yamlwrite.standard())
+        Err(NotEmittable(_)) => test.assert(true)
+        _                    => test.fail("a sequence key has no block spelling here")
+    test.assert(yamlwrite.check(YamlMap([YamlPair { key: YamlStr("a"), value: complex }])) != None)
+
+@test
+fn test_paths_at_their_edges() [io]
+    let doc = value("a:\n  \"b.c\": 1\n  list: [x, {y: 2}]\n  f: 1.5\n  e: {}\n  s: []\n")
+
+    test.case("a quoted segment is a key whole, dots included")
+    test.assert(yamlkeys.int_at(doc, "a.\"b.c\"")! == 1)
+    test.assert(yamlkeys.path_of(["a", "b.c", ""]) == "a.\"b.c\".\"\"")
+
+    test.case("a malformed path is NoSuchKey with the path as written")
+    for bad in [".a", "a..b", "a.", "a.\"b", "a.\"b\"c"]
+        match yamlkeys.get(doc, bad)
+            Err(NoSuchKey(p)) => test.assert(p == bad)
+            _                 => test.fail("a malformed path names itself")
+        test.assert(yamlkeys.find(doc, bad) == None)
+    test.assert(yamlnode.equal(yamlkeys.get(doc, "")!, doc))
+
+    test.case("typed reads of the other kinds")
+    test.assert(yamlkeys.float_at(doc, "a.f")! == 1.5)
+    test.assert(yamlkeys.find(doc, "a.list.\"\"") == None)
+    test.assert(yamlkeys.find(doc, "a.list.x") == None)
+    test.assert(yamlkeys.find(doc, "a.f.x") == None)
+    match yamlkeys.seq_at(doc, "a.f")
+        Err(WrongKind(_, want, _)) => test.assert(want == "seq")
+        _                          => test.fail("a float is not a sequence")
+    match yamlkeys.map_at(doc, "a.f")
+        Err(WrongKind(_, want, _)) => test.assert(want == "map")
+        _                          => test.fail("a float is not a mapping")
+
+    test.case("paths name the empty collections as leaves")
+    let ps = yamlkeys.paths(doc)
+    test.assert(list.contains(ps, "a.e"))
+    test.assert(list.contains(ps, "a.s"))
+
+    test.case("set replaces an item, refuses a key on a sequence, and sets the root")
+    let s1 = yamlkeys.set(doc, "a.list.1.y", YamlInt(3))!
+    test.assert(yamlkeys.int_at(s1, "a.list.1.y")! == 3)
+    match yamlkeys.set(doc, "a.list.k", YamlInt(1))
+        Err(WrongKind(p, _, _)) => test.assert(p == "a.list.k")
+        _                       => test.fail("a sequence has no key k")
+    test.assert(yamlnode.equal(yamlkeys.set(doc, "", YamlInt(1))!, YamlInt(1)))
+
+    test.case("remove refuses the root, an index past the end and a path through a scalar")
+    for bad in ["", "a.list.9", "a.list.x", "a.f.x"]
+        match yamlkeys.remove(doc, bad)
+            Err(NoSuchKey(_)) => test.assert(true)
+            _                 => test.fail("nothing to remove")
+    let r1 = yamlkeys.remove(doc, "a.list.1.y")!
+    test.assert(yamlkeys.find(r1, "a.list.1.y") == None)
+    test.assert(yamlkeys.has(r1, "a.list.0"))

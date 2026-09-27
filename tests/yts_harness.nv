@@ -1,0 +1,86 @@
+// yts_harness.nv — parses every case of a yaml-test-suite extract and
+// prints each result as JSON, for tools/yaml_test_suite.sh to compare
+// with the suite's own `in.json`.
+//
+// Usage: yts_harness <cases file>
+//
+// The cases file holds each case as `\x01id\x02tags\x03yaml`, where
+// tags are the tags the case writes, separated by `\x04`: the harness
+// allows exactly those, since the suite is about the grammar and not
+// about which tags a loader honours.
+
+use yamlnode
+use yamlread
+use yamlsafe
+use yamlwrite
+
+fn json_str(s: Str) -> Str
+    var parts: [Str] = ["\""]
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b == '"'
+            list.push(parts, "\\\"")
+        elif b == '\\'
+            list.push(parts, "\\\\")
+        elif b == '\n'
+            list.push(parts, "\\n")
+        elif b == '\t'
+            list.push(parts, "\\t")
+        elif b == '\r'
+            list.push(parts, "\\r")
+        elif b < 32
+            list.push(parts,
+                "\\u00" + (if b < 16 then "0" else "1") + str.slice("0123456789abcdef", b % 16, b % 16 + 1))
+        else
+            list.push(parts, str.from_byte(b))
+    list.push(parts, "\"")
+    str.join(parts, "")
+
+fn key_json(k: YamlValue) -> Str
+    match k
+        YamlStr(s) => json_str(s)
+        YamlNull   => json_str("")
+        _          => json_str(yamlwrite.scalar_to_string(k))
+
+fn to_json(v: YamlValue) -> Str
+    match v
+        YamlMap(pairs) =>
+            var parts: [Str] = []
+            for p in pairs
+                list.push(parts, key_json(p.key) + ":" + to_json(p.value))
+            "{" + str.join(parts, ",") + "}"
+        YamlSeq(items) =>
+            var parts: [Str] = []
+            for x in items
+                list.push(parts, to_json(x))
+            "[" + str.join(parts, ",") + "]"
+        YamlStr(s)     => json_str(s)
+        YamlInt(i)     => "${i}"
+        YamlFloat(f)   => if f != f or f > 1.0e308 or f < -1.0e308
+            json_str(yamlwrite.scalar_to_string(v))
+        else
+            str.from_float_shortest(f)
+        YamlBool(b)    => str.from_bool(b)
+        YamlNull       => "null"
+
+fn main() [io, fs]
+    let args = env.user_args()
+    let data = fs.read(args[0]) ?? ""
+    for chunk in str.split(data, "\u{1}")
+        if chunk == ""
+            continue
+        let a = str.split(chunk, "\u{2}")
+        let b = str.split(a[1], "\u{3}")
+        var tags: [Str] = []
+        for t in str.split(b[0], "\u{4}")
+            if t != ""
+                list.push(tags, t)
+        let policy = yamlsafe.with_complex_keys(yamlsafe.allowing(yamlsafe.standard(), tags), true)
+        match yamlread.parse_stream(b[1], policy)
+            Ok(docs) =>
+                var parts: [Str] = []
+                for d in docs
+                    list.push(parts, to_json(d))
+                println(a[0] + "\tOK\t[" + str.join(parts, ",") + "]")
+            Err(e)   =>
+                println(a[0] + "\tERR\t" + yamlerror.render(e, "in.yaml"))

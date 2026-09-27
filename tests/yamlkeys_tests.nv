@@ -1,12 +1,9 @@
-// yamlkeys_tests.nv — the API suite for path access.
+// yamlkeys_tests.nv — path access.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// yaml-nv.yamlkeys.<fn>`.  What is asserted is the contract of the two
-// lookup channels and of the path language — including the one place
-// this package deliberately differs from toml-nv's.
-//
-// The helpers read a fixture that is known good.  A case whose SUBJECT
-// is a refusal matches the `Result` in full instead.
+// The contract of the two lookup channels and of the path language,
+// including the one place it differs from toml-nv's: a digit segment
+// indexes a sequence.  The helpers read a fixture that is known good; a
+// case whose subject is a refusal matches the `Result` in full.
 
 use std.test
 use yamlnode
@@ -61,11 +58,10 @@ fn manifest() -> YamlValue
 
 @test
 fn test_a_numeric_segment_indexes_a_sequence() [io]
-    // THE ONE PLACE THIS PACKAGE DIFFERS FROM toml-nv's PATH LANGUAGE,
-    // and it is deliberate.  TOML has no index syntax and `a.0` there
+    // The one place this path language differs from toml-nv's.  TOML has no index syntax and `a.0` there
     // is a bare key called `0`, so treating digits as an index would
     // be ambiguous in a format where it is not.  YAML mappings are
-    // keyed by NODES, so `0` as a key is an integer key a string path
+    // keyed by nodes, so `0` as a key is an integer key a string path
     // could never have addressed — the digits are free, and the
     // manifests that are most of the world's YAML need to index lists.
     test.case("a digit segment walks into a sequence")
@@ -282,17 +278,20 @@ fn test_merge_is_the_visible_version_of_yamls_own_merge_key() [io]
             YamlPair { key: YamlStr("replicas"), value: YamlInt(3) }]) },
         YamlPair { key: YamlStr("hosts"), value: YamlSeq([YamlStr("c")]) }])
 
-    match yamlkeys.merge(base, over)
-        Ok(m)  =>
-            test.case("mappings merge key by key")
-            test.assert(int_of(m, "spec.replicas") == 3)
+    let m = yamlkeys.merge(base, over)
 
-            test.case("a key only in base survives")
-            test.assert(str_of(m, "spec.image") == "nginx")
+    test.case("mappings merge key by key")
+    test.assert(int_of(m, "spec.replicas") == 3)
 
-            test.case("a sequence REPLACES rather than appends — the caller decides")
-            match yamlkeys.seq_at(m, "hosts")
-                Ok(hs) => test.assert(list.len(hs) == 1)
-                Err(_) => test.fail("`hosts` is a sequence in both trees")
+    test.case("a key only in base survives")
+    test.assert(str_of(m, "spec.image") == "nginx")
 
-        Err(_) => test.fail("two mappings always merge")
+    test.case("a sequence replaces rather than appends — the caller decides")
+    match yamlkeys.seq_at(m, "hosts")
+        Ok(hs) => test.assert(list.len(hs) == 1)
+        Err(_) => test.fail("`hosts` is a sequence in both trees")
+
+    test.case("a key only in the overlay is appended, and a scalar overlay replaces")
+    let extra = yamlkeys.merge(base, YamlMap([YamlPair { key: YamlStr("new"), value: YamlInt(1) }]))
+    test.assert(yamlkeys.paths(extra)[4] == "new")
+    test.assert(yamlnode.equal(yamlkeys.merge(base, YamlInt(7)), YamlInt(7)))

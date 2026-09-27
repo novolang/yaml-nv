@@ -1,10 +1,7 @@
-// yamlnode_tests.nv — the API suite for the value tree and for scalar
-// resolution.
+// yamlnode_tests.nv — the value tree and scalar resolution.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// yaml-nv.yamlnode.<fn>`.  What is asserted is which schema resolves
-// what — including the Norway problem, which is the single most
-// consequential rule in this package.
+// Which schema resolves what, including the rule that under the core
+// schema `no` is a string.
 
 use std.test
 use yamlnode
@@ -50,7 +47,7 @@ fn test_kind_of_names_every_arm() [io]
 
 @test
 fn test_the_core_schema_keeps_norway() [io]
-    // THE SINGLE MOST CONSEQUENTIAL RULE IN THIS PACKAGE.  YAML 1.1
+    // YAML 1.1
     // resolved `no` to false, which is why a country list containing
     // Norway loses a country.  YAML 1.2's core schema does not, this
     // package implements 1.2, and the 1.1 reading is available only to

@@ -1,11 +1,8 @@
-// yamlsafe_tests.nv — the API suite for the safety policy, which is
-// this package's load-bearing interface.
+// yamlsafe_tests.nv — the safety policy.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// yaml-nv.yamlsafe.<fn>`.  What is asserted is the design — that this
-// package has NO unsafe loader to be the default of, that widening it
-// is a thing a reviewer can see, and that the three budgets answer
-// three different questions.
+// That this package has no unsafe loader to be the default of, that
+// widening it is a call a reviewer can see, and that the three budgets
+// answer three different questions.
 
 use std.test
 use yamlerror
@@ -13,7 +10,7 @@ use yamlsafe
 
 @test
 fn test_the_standard_policy_refuses_every_non_core_tag() [io]
-    // THE DESIGN, ASSERTED.  There is one reader and its safety is a
+    // There is one reader and its safety is a
     // value; the value's default refuses everything the core schema
     // does not define.  A package with a second `unsafe_load` would
     // have made the shorter name the dangerous one, which is the
@@ -38,7 +35,7 @@ fn test_the_standard_policy_refuses_every_non_core_tag() [io]
 
 @test
 fn test_widening_the_loader_is_a_call_a_reviewer_can_see() [io]
-    // `allowing` is the ONE way to widen this loader, and it takes a
+    // `allowing` is the one way to widen this loader, and it takes a
     // literal list so the widening appears in the caller's diff.
     let p = yamlsafe.allowing(yamlsafe.standard(), ["!Ref", "!GetAtt"])
 
@@ -124,7 +121,7 @@ fn test_each_budget_can_be_replaced_one_at_a_time() [io]
 @test
 fn test_check_measures_a_tree_the_caller_already_holds() [io]
     // The reader applies the budgets while it reads; this is the same
-    // check on a tree built by hand, for the program that GENERATES
+    // check on a tree built by hand, for the program that generates
     // YAML and needs to know its output will be accepted by a reader
     // stricter than itself.
     test.case("a tree inside the budget passes")

@@ -1,12 +1,8 @@
 // yamlcover_tests.nv — the rest of the public surface, one case each.
 //
-// RED ON PURPOSE, like every suite here: each assertion reaches `not
-// implemented: yaml-nv.<module>.<fn>`.
-//
-// The three suites beside this one assert the DESIGN — the safety
-// policy, the schemas, the reader's contract.  This one exists so that
-// no public function ships without a written expectation of what it
-// answers, including the ones whose behaviour is a single sentence.
+// The suites beside this one assert the design: the safety policy, the
+// schemas, the reader's contract.  This one gives every other public
+// function a written expectation of what it answers.
 
 use std.test
 use yamlnode
