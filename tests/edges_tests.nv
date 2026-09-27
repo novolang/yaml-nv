@@ -122,6 +122,10 @@ fn test_equality_and_depth_across_kinds() [io]
     test.assert(not yamlnode.equal(YamlSeq([YamlInt(1)]), YamlSeq([])))
     test.assert(not yamlnode.equal(YamlMap([YamlPair { key: YamlInt(1), value: YamlNull }]), YamlMap([])))
 
+    test.case("a key deeper than its value counts, and +.inf is infinity")
+    test.assert(yamlnode.depth(YamlMap([YamlPair { key: YamlSeq([YamlSeq([])]), value: YamlInt(1) }])) == 3)
+    test.assert(yamlnode.equal(yamlnode.resolve("+.inf", SchemaCore), YamlFloat(1.0 / 0.0)))
+
     test.case("depth takes the deepest branch, keys included")
     let deep = YamlMap([YamlPair { key: YamlStr("a"), value: YamlInt(1) },
                         YamlPair { key: YamlStr("b"), value: YamlSeq([YamlSeq([])]) }])
@@ -270,6 +274,18 @@ fn test_the_reader_at_the_byte_level() [io]
     match yamlread.finish(second.0)
         Ok(docs) => test.assert(yamlkeys.str_at(docs[0], "a")! == "é")
         Err(_)   => test.fail("the split sequence was joined")
+
+    test.case("a three-byte and a four-byte sequence split between chunks")
+    let three = bytes.to_byte_list(bytes.from_str("a: \u{20AC}\n"))
+    let t1 = yamlread.feed(yamlread.reader(std()), bytes.from_byte_list(three[0:4]))
+    let t2 = yamlread.feed(t1.0, bytes.from_byte_list(three[4:list.len(three)]))
+    let docs3 = yamlread.finish(t2.0)!
+    test.assert(yamlkeys.str_at(docs3[0], "a")! == "\u{20AC}")
+    let four = bytes.to_byte_list(bytes.from_str("a: \u{1F600}\n"))
+    let f1 = yamlread.feed(yamlread.reader(std()), bytes.from_byte_list(four[0:5]))
+    let f2 = yamlread.feed(f1.0, bytes.from_byte_list(four[5:list.len(four)]))
+    let docs4 = yamlread.finish(f2.0)!
+    test.assert(yamlkeys.str_at(docs4[0], "a")! == "\u{1F600}")
 
     test.case("a lone continuation byte is refused")
     match yamlread.parse_bytes(bytes.from_byte_list([0x82]), std())
@@ -437,6 +453,9 @@ fn test_paths_at_their_edges() [io]
             _                 => test.fail("a malformed path names itself")
         test.assert(yamlkeys.find(doc, bad) == None)
     test.assert(yamlnode.equal(yamlkeys.get(doc, "")!, doc))
+
+    test.case("an index too long to be a number finds nothing")
+    test.assert(yamlkeys.find(doc, "a.list.12345678901234567890") == None)
 
     test.case("typed reads of the other kinds")
     test.assert(yamlkeys.float_at(doc, "a.f")! == 1.5)

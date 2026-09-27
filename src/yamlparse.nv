@@ -784,11 +784,9 @@ fn block_scalar(var p: Parser, n: Int) -> Result<Str, YamlError>
         (if n < 0 then 0 else n) + explicit
     else
         -1
-    // Find the content's indentation from its first non-empty line.
-    var k = if p.pos < p.n
-        p.pos + 1
-    else
-        p.n
+    // Find the content's indentation from its first non-empty line.  The
+    // header's line ends in a line break, since a document's text does.
+    var k = p.pos + 1
     var widest_empty = 0
     var widest_line = 0
     if indent < 0
@@ -816,10 +814,7 @@ fn block_scalar(var p: Parser, n: Int) -> Result<Str, YamlError>
             return Err(BadBlockScalar(lc.0, lc.1, "has a leading empty line indented past its first line"))
     // Read the lines that belong to it.
     var lines: [Str] = []
-    var line_at = if p.pos < p.n
-        p.pos + 1
-    else
-        p.n
+    var line_at = p.pos + 1
     var end_at = line_at
     for _ in 0..p.n + 1
         if line_at >= p.n
@@ -835,15 +830,9 @@ fn block_scalar(var p: Parser, n: Int) -> Result<Str, YamlError>
             list.push(lines, "")
         else
             break
-        end_at = if e < p.n
-            e + 1
-        else
-            e
+        end_at = e + 1
         line_at = end_at
-    p.pos = if end_at > p.pos
-        end_at - 1
-    else
-        p.pos
+    p.pos = end_at - 1
     let text = if folded
         fold_lines(lines)
     else
@@ -1100,11 +1089,7 @@ fn escape(p: Parser, pos: Int) -> Result<Str, YamlError>
 
 fn bad_escape(p: Parser, pos: Int, end: Int) -> YamlError
     let lc = line_col(p, pos)
-    let e = if end > p.n
-        p.n
-    else
-        end
-    BadEscape(lc.0, lc.1, str.slice(p.s, pos, e))
+    BadEscape(lc.0, lc.1, str.slice(p.s, pos, end))
 
 fn simple_escape(c: Int) -> Int
     if c == '0'
