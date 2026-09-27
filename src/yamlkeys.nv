@@ -1,37 +1,25 @@
 // yamlkeys.nv — reaching into a parsed document by path.
 //
-// TWO CHANNELS, AND WHICH ONE TO USE
-//
-// Every lookup comes in two forms and they answer different questions:
+// Every lookup comes in two forms, and they answer different questions:
 //
 //   `get`, `str_at`, `int_at`, …    ->  Result<T, YamlError>
 //   `find`, `opt_str`, `opt_int`, … ->  ?T
 //
-// The `Result` form is for a caller reading a REQUIRED setting: it
-// distinguishes `NoSuchKey("spec.replicas")` from
+// The `Result` form is for a required setting.  It tells
+// `NoSuchKey("spec.replicas")` from
 // `WrongKind("spec.replicas", "int", "str")`, which are two different
-// sentences to show a user and two different fixes.  The `?T` form is
-// for an OPTIONAL one, where "absent" and "the wrong shape" both mean
-// "use the default".
+// fixes.  The optional form is for a setting with a default, where
+// "absent" and "the wrong shape" both mean "use the default".
 //
-// THE PATH LANGUAGE WALKS MAPPINGS AND SEQUENCES BOTH
-//
-// `"spec.template.spec.containers.0.image"` — a dot between segments,
-// and a segment that is all digits indexes a SEQUENCE.  That is a
-// choice worth naming, because toml-nv makes the opposite one: TOML
-// has no index syntax and `a.0` there is a bare key called `0`, so
-// treating it as an index would be ambiguous in a format where it is
-// not.  YAML mappings are keyed by nodes rather than by strings, and
-// `0` as a mapping key is an INTEGER key that a string path could not
-// have addressed anyway — so the digits are free, and the Kubernetes
-// manifests that are most of the world's YAML are exactly the
-// documents that need to index a list.
-//
-// A mapping that really does have the string key `"0"` is reached with
-// `child`, which takes the key whole and interprets nothing.  A
-// mapping keyed by a sequence is reached with `yamlnode.pairs_of`,
-// because no string path can name it.
+// A path is segments separated by dots, and a segment that is all
+// digits indexes a sequence: `"spec.containers.0.image"`.  In YAML a
+// digit key in a mapping is an integer key, which a string path could
+// not name anyway, so the digits are free for indexing.  A segment in
+// double quotes is a key whole, dots and all: `a."b.c"`.  `child` takes
+// one key and interprets nothing.
 
+use std.str
+use std.list
 use yamlnode
 
 // The node at a path, or why not.
@@ -49,7 +37,10 @@ use yamlnode
 //         Err(e) => println(e.message())
 // ```
 pub fn get(v: YamlValue, path: Str) -> Result<YamlValue, YamlError>
-    todo("yaml-nv.yamlkeys.get")
+    let segs = path_segments(path)!
+    match walk(v, segs)
+        Some(found) => Ok(found)
+        None        => Err(NoSuchKey(path))
 
 // The node at a path, or `None`.
 //
@@ -65,7 +56,9 @@ pub fn get(v: YamlValue, path: Str) -> Result<YamlValue, YamlError>
 //         None    => println("unset")
 // ```
 pub fn find(v: YamlValue, path: Str) -> ?YamlValue
-    todo("yaml-nv.yamlkeys.find")
+    match path_segments(path)
+        Ok(segs) => walk(v, segs)
+        Err(_)   => None
 
 // Whether a path resolves.
 //
@@ -84,7 +77,7 @@ pub fn find(v: YamlValue, path: Str) -> ?YamlValue
 //     println("${yamlkeys.has(doc, "a")}")      // true
 // ```
 pub fn has(v: YamlValue, path: Str) -> Bool
-    todo("yaml-nv.yamlkeys.has")
+    find(v, path) != None
 
 // Whether a path resolves to the null node.
 //
@@ -105,14 +98,16 @@ pub fn has(v: YamlValue, path: Str) -> Bool
 //     println("${yamlkeys.is_null_at(doc, "b")}")    // false — b is absent
 // ```
 pub fn is_null_at(v: YamlValue, path: Str) -> Bool
-    todo("yaml-nv.yamlkeys.is_null_at")
+    match find(v, path)
+        Some(found) => yamlnode.kind_of(found) == KindNull
+        None        => false
 
 // One key of one mapping, with no path walking and no digit
 // interpretation.
 //
 // The primitive `get` is written in terms of, and the call for a
 // caller whose key contains a dot or is all digits.  It matches
-// STRING keys only.
+// string keys only.
 //
 // ```novo
 // use yamlread
@@ -126,7 +121,11 @@ pub fn is_null_at(v: YamlValue, path: Str) -> Bool
 //         None    => println("no")
 // ```
 pub fn child(v: YamlValue, key: Str) -> ?YamlValue
-    todo("yaml-nv.yamlkeys.child")
+    for pair in yamlnode.pairs_of(v)
+        if let YamlStr(k) = pair.key
+            if k == key
+                return Some(pair.value)
+    None
 
 // One item of a sequence, by 0-based index.
 //
@@ -146,7 +145,10 @@ pub fn child(v: YamlValue, key: Str) -> ?YamlValue
 //         None    => println("no")
 // ```
 pub fn at(v: YamlValue, index: Int) -> ?YamlValue
-    todo("yaml-nv.yamlkeys.at")
+    let items = yamlnode.items_of(v)
+    if index < 0 or index >= list.len(items)
+        return None
+    Some(items[index])
 
 // A path split into its segments.
 //
@@ -162,7 +164,31 @@ pub fn at(v: YamlValue, index: Int) -> ?YamlValue
 //     println("${list.len(yamlkeys.path_segments("a.b.0")!)}")   // 3
 // ```
 pub fn path_segments(path: Str) -> Result<[Str], YamlError>
-    todo("yaml-nv.yamlkeys.path_segments")
+    var segs: [Str] = []
+    let n = str.len(path)
+    if n == 0
+        return Ok(segs)
+    var i = 0
+    for _ in 0..n + 1
+        if str.byte_at_or(path, i, 0) == '"'
+            match str.index_from(path, "\"", i + 1)
+                Some(k) =>
+                    list.push(segs, str.slice(path, i + 1, k))
+                    i = k + 1
+                None    =>
+                    return Err(NoSuchKey(path))
+        else
+            let k = str.index_from(path, ".", i) ?? n
+            if k == i
+                return Err(NoSuchKey(path))
+            list.push(segs, str.slice(path, i, k))
+            i = k
+        if i >= n
+            break
+        if str.byte_at_or(path, i, 0) != '.' or i + 1 >= n
+            return Err(NoSuchKey(path))
+        i = i + 1
+    Ok(segs)
 
 // Segments joined back into a path.
 //
@@ -176,7 +202,13 @@ pub fn path_segments(path: Str) -> Result<[Str], YamlError>
 //     println(yamlkeys.path_of(["spec", "replicas"]))   // spec.replicas
 // ```
 pub fn path_of(segments: [Str]) -> Str
-    todo("yaml-nv.yamlkeys.path_of")
+    var parts: [Str] = []
+    for seg in segments
+        if str.contains(seg, ".") or seg == ""
+            list.push(parts, "\"" + seg + "\"")
+        else
+            list.push(parts, seg)
+    str.join(parts, ".")
 
 // Every leaf path in a document, depth first, in document order.
 //
@@ -185,7 +217,7 @@ pub fn path_of(segments: [Str]) -> Str
 // prints, what a schema check walks, and what a diff between two
 // manifests compares.
 //
-// A path under a mapping key that is NOT a string is omitted, because
+// A path under a mapping key that is not a string is omitted, because
 // no string path names it — `yamlnode.pairs_of` is where those live,
 // and a caller that has them knows it does.
 //
@@ -199,11 +231,13 @@ pub fn path_of(segments: [Str]) -> Str
 //     println(list.join(yamlkeys.paths(doc), " "))   // a.0 a.1
 // ```
 pub fn paths(v: YamlValue) -> [Str]
-    todo("yaml-nv.yamlkeys.paths")
+    var out: [Str] = []
+    collect_paths(v, [], out)
+    out
 
 // The string at a path, or why not.
 //
-// The value is NOT coerced: a `port: 8080` read as a string is a
+// The value is not coerced: a `port: 8080` read as a string is a
 // mistake in the caller or the file, and returning `"8080"` would hide
 // which.  A quoted `"8080"` in the document IS a string and answers.
 //
@@ -217,7 +251,10 @@ pub fn paths(v: YamlValue) -> [Str]
 //     println(yamlkeys.str_at(doc, "db.host")!)      // localhost
 // ```
 pub fn str_at(v: YamlValue, path: Str) -> Result<Str, YamlError>
-    todo("yaml-nv.yamlkeys.str_at")
+    let found = get(v, path)!
+    match found
+        YamlStr(s) => Ok(s)
+        _          => Err(WrongKind(path, "str", yamlnode.kind_name(found)))
 
 // The integer at a path, or why not.
 //
@@ -235,7 +272,10 @@ pub fn str_at(v: YamlValue, path: Str) -> Result<Str, YamlError>
 //     println("${yamlkeys.int_at(doc, "replicas")!}")   // 3
 // ```
 pub fn int_at(v: YamlValue, path: Str) -> Result<Int, YamlError>
-    todo("yaml-nv.yamlkeys.int_at")
+    let found = get(v, path)!
+    match found
+        YamlInt(i) => Ok(i)
+        _          => Err(WrongKind(path, "int", yamlnode.kind_name(found)))
 
 // The float at a path, or why not.
 //
@@ -254,11 +294,15 @@ pub fn int_at(v: YamlValue, path: Str) -> Result<Int, YamlError>
 //     println("${yamlkeys.float_at(doc, "timeout")!}")   // 30
 // ```
 pub fn float_at(v: YamlValue, path: Str) -> Result<Float, YamlError>
-    todo("yaml-nv.yamlkeys.float_at")
+    let found = get(v, path)!
+    match found
+        YamlFloat(f) => Ok(f)
+        YamlInt(i)   => Ok(i as Float)
+        _            => Err(WrongKind(path, "float", yamlnode.kind_name(found)))
 
 // The boolean at a path, or why not.
 //
-// Under `SchemaCore`, `yes` and `on` are STRINGS and reach here as
+// Under `SchemaCore`, `yes` and `on` are strings and reach here as
 // `WrongKind` — which is the Norway problem showing up as an honest
 // error instead of as a silently wrong value.
 //
@@ -272,7 +316,10 @@ pub fn float_at(v: YamlValue, path: Str) -> Result<Float, YamlError>
 //     println("${yamlkeys.bool_at(doc, "debug")!}")      // true
 // ```
 pub fn bool_at(v: YamlValue, path: Str) -> Result<Bool, YamlError>
-    todo("yaml-nv.yamlkeys.bool_at")
+    let found = get(v, path)!
+    match found
+        YamlBool(b) => Ok(b)
+        _           => Err(WrongKind(path, "bool", yamlnode.kind_name(found)))
 
 // The sequence at a path, as its items.
 //
@@ -286,7 +333,10 @@ pub fn bool_at(v: YamlValue, path: Str) -> Result<Bool, YamlError>
 //     println("${list.len(yamlkeys.seq_at(doc, "ports")!)}")   // 2
 // ```
 pub fn seq_at(v: YamlValue, path: Str) -> Result<[YamlValue], YamlError>
-    todo("yaml-nv.yamlkeys.seq_at")
+    let found = get(v, path)!
+    match found
+        YamlSeq(items) => Ok(items[:])
+        _              => Err(WrongKind(path, "seq", yamlnode.kind_name(found)))
 
 // The mapping at a path, as its pairs in document order.
 //
@@ -300,7 +350,10 @@ pub fn seq_at(v: YamlValue, path: Str) -> Result<[YamlValue], YamlError>
 //     println("${list.len(yamlkeys.map_at(doc, "db")!)}")      // 1
 // ```
 pub fn map_at(v: YamlValue, path: Str) -> Result<[YamlPair], YamlError>
-    todo("yaml-nv.yamlkeys.map_at")
+    let found = get(v, path)!
+    match found
+        YamlMap(pairs) => Ok(pairs[:])
+        _              => Err(WrongKind(path, "map", yamlnode.kind_name(found)))
 
 // A mapping's string keys, in document order.
 //
@@ -318,7 +371,11 @@ pub fn map_at(v: YamlValue, path: Str) -> Result<[YamlPair], YamlError>
 //     println("${list.len(yamlkeys.str_keys(doc))}")   // 2
 // ```
 pub fn str_keys(v: YamlValue) -> [Str]
-    todo("yaml-nv.yamlkeys.str_keys")
+    var out: [Str] = []
+    for pair in yamlnode.pairs_of(v)
+        if let YamlStr(k) = pair.key
+            list.push(out, k)
+    out
 
 // A pair's key as a string, or `None` when it is not one.
 //
@@ -335,7 +392,9 @@ pub fn str_keys(v: YamlValue) -> [Str]
 //     println(yamlkeys.str_key_of(p) ?? "«not a string key»")   // a
 // ```
 pub fn str_key_of(p: YamlPair) -> ?Str
-    todo("yaml-nv.yamlkeys.str_key_of")
+    match p.key
+        YamlStr(k) => Some(k)
+        _          => None
 
 // The string at a path, or `None`.
 //
@@ -349,7 +408,9 @@ pub fn str_key_of(p: YamlPair) -> ?Str
 //     println(yamlkeys.opt_str(doc, "db.host") ?? "127.0.0.1")
 // ```
 pub fn opt_str(v: YamlValue, path: Str) -> ?Str
-    todo("yaml-nv.yamlkeys.opt_str")
+    match str_at(v, path)
+        Ok(s)  => Some(s)
+        Err(_) => None
 
 // The integer at a path, or `None`.
 //
@@ -363,7 +424,9 @@ pub fn opt_str(v: YamlValue, path: Str) -> ?Str
 //     println("${yamlkeys.opt_int(doc, "spec.replicas") ?? 1}")
 // ```
 pub fn opt_int(v: YamlValue, path: Str) -> ?Int
-    todo("yaml-nv.yamlkeys.opt_int")
+    match int_at(v, path)
+        Ok(i)  => Some(i)
+        Err(_) => None
 
 // The float at a path, or `None`.  Widens an integer, as `float_at`
 // does.
@@ -378,7 +441,9 @@ pub fn opt_int(v: YamlValue, path: Str) -> ?Int
 //     println("${yamlkeys.opt_float(doc, "timeout") ?? 5.0}")
 // ```
 pub fn opt_float(v: YamlValue, path: Str) -> ?Float
-    todo("yaml-nv.yamlkeys.opt_float")
+    match float_at(v, path)
+        Ok(f)  => Some(f)
+        Err(_) => None
 
 // The boolean at a path, or `None`.
 //
@@ -392,18 +457,20 @@ pub fn opt_float(v: YamlValue, path: Str) -> ?Float
 //     println("${yamlkeys.opt_bool(doc, "log.debug") ?? false}")
 // ```
 pub fn opt_bool(v: YamlValue, path: Str) -> ?Bool
-    todo("yaml-nv.yamlkeys.opt_bool")
+    match bool_at(v, path)
+        Ok(b)  => Some(b)
+        Err(_) => None
 
 // A copy of the document with the node at a path replaced or added.
 //
-// A NEW tree: `[mutate]` is a host effect and this package has none.
+// A new tree: `[mutate]` is a host effect and this package has none.
 // Missing intermediate mappings are created, in the order the path
 // names them, and appended at the end of their parent.  A path whose
-// intermediate segment resolves to a NON-collection is `WrongKind`
+// intermediate segment resolves to a non-collection is `WrongKind`
 // rather than an overwrite, because silently replacing `a: 1` when
 // told to set `a.b` is how a configuration loses a setting.
 //
-// A numeric segment past the end of a sequence APPENDS rather than
+// A numeric segment past the end of a sequence appends rather than
 // padding with nulls: `containers.9` on a one-item list adds a second
 // item.  Padding would put nodes in a manifest nobody wrote.
 //
@@ -419,7 +486,8 @@ pub fn opt_bool(v: YamlValue, path: Str) -> ?Bool
 //     println("${yamlkeys.int_at(next, "spec.replicas")!}")   // 3
 // ```
 pub fn set(v: YamlValue, path: Str, value: YamlValue) -> Result<YamlValue, YamlError>
-    todo("yaml-nv.yamlkeys.set")
+    let segs = path_segments(path)!
+    set_in(v, segs, 0, value, path)
 
 // A copy of the document with the node at a path removed.
 //
@@ -439,21 +507,22 @@ pub fn set(v: YamlValue, path: Str, value: YamlValue) -> Result<YamlValue, YamlE
 //     println("${list.len(yamlkeys.seq_at(yamlkeys.remove(doc, "a.0")!, "a")!)}")
 // ```
 pub fn remove(v: YamlValue, path: Str) -> Result<YamlValue, YamlError>
-    todo("yaml-nv.yamlkeys.remove")
+    let segs = path_segments(path)!
+    if list.len(segs) == 0
+        return Err(NoSuchKey(path))
+    remove_in(v, segs, 0, path)
 
 // A copy of `base` with every leaf of `overlay` written over it.
 //
-// Mappings merge key by key; everything else replaces whole — a
+// Mappings merge key by key; everything else replaces whole.  A
 // sequence in `overlay` replaces the one in `base` rather than
-// appending, because "the user's list plus the default's" is a
-// decision the caller makes.  Keys only in `base` survive; keys only
-// in `overlay` are appended in `overlay`'s order.
+// appending, because combining two lists is a decision the caller
+// makes.  Keys only in `base` keep their place; keys only in `overlay`
+// are appended in `overlay`'s order.
 //
-// This is what a layered configuration is written with, and what a
-// Kustomize-shaped overlay is.  It is NOT YAML's own `<<` merge key,
-// which is a 1.1 feature this package does not resolve — a `<<` in a
-// document is an ordinary string key here, and doing the merge is
-// this function, at a call site, where a reader can see it happen.
+// This is how a layered configuration is written.  It is not YAML
+// 1.1's `<<` merge key, which this package does not resolve: a `<<` in
+// a document is an ordinary string key here.
 //
 // ```novo
 // use yamlread
@@ -463,9 +532,156 @@ pub fn remove(v: YamlValue, path: Str) -> Result<YamlValue, YamlError>
 // fn main() [io]
 //     let base = yamlread.parse("a: 1\nb: 2\n", yamlsafe.standard())!
 //     let over = yamlread.parse("b: 3\n", yamlsafe.standard())!
-//     let m = yamlkeys.merge(base, over)!
+//     let m = yamlkeys.merge(base, over)
 //     println("${yamlkeys.int_at(m, "b")!}")    // 3
 //     println("${yamlkeys.int_at(m, "a")!}")    // 1
 // ```
-pub fn merge(base: YamlValue, overlay: YamlValue) -> Result<YamlValue, YamlError>
-    todo("yaml-nv.yamlkeys.merge")
+pub fn merge(base: YamlValue, overlay: YamlValue) -> YamlValue
+    match base
+        YamlMap(bp) =>
+            match overlay
+                YamlMap(op) => YamlMap(merged_pairs(bp, op))
+                _           => overlay
+        _           =>
+            overlay
+
+// ── Walking and rebuilding ────────────────────────────────────────────
+
+fn is_index(seg: Str) -> Bool
+    if seg == ""
+        return false
+    for i in 0..str.len(seg)
+        let b = str.byte_at_or(seg, i, 0)
+        if b < '0' or b > '9'
+            return false
+    true
+
+fn index_of(seg: Str) -> Int
+    if str.len(seg) > 18
+        999999999999999999
+    else
+        str.to_int(seg) ?? 0
+
+// One step down: a mapping's string key, or a sequence's index.
+fn step(v: YamlValue, seg: Str) -> ?YamlValue
+    match v
+        YamlMap(_) => child(v, seg)
+        YamlSeq(_) => if is_index(seg)
+            at(v, index_of(seg))
+        else
+            None
+        _          => None
+
+fn walk(v: YamlValue, segs: [Str]) -> ?YamlValue
+    var cur = v
+    for seg in segs
+        match step(cur, seg)
+            Some(next) =>
+                cur = next
+            None       =>
+                return None
+    Some(cur)
+
+fn collect_paths(v: YamlValue, prefix: [Str], var out: [Str])
+    match v
+        YamlMap(pairs) =>
+            if list.len(pairs) == 0 and list.len(prefix) > 0
+                list.push(out, path_of(prefix))
+            for pair in pairs
+                if let YamlStr(k) = pair.key
+                    collect_paths(pair.value, list.concat(prefix, [k]), out)
+        YamlSeq(items) =>
+            if list.len(items) == 0 and list.len(prefix) > 0
+                list.push(out, path_of(prefix))
+            for i in 0..list.len(items)
+                collect_paths(items[i], list.concat(prefix, ["${i}"]), out)
+        _              =>
+            list.push(out, path_of(prefix))
+
+fn set_in(v: YamlValue, segs: [Str], i: Int, value: YamlValue,
+          path: Str) -> Result<YamlValue, YamlError>
+    if i >= list.len(segs)
+        return Ok(value)
+    let seg = segs[i]
+    match v
+        YamlMap(pairs) =>
+            var out: [YamlPair] = []
+            var found = false
+            for pair in pairs
+                var matched = false
+                if let YamlStr(k) = pair.key
+                    matched = k == seg
+                if matched and not found
+                    found = true
+                    list.push(out, YamlPair { key: pair.key,
+                                              value: set_in(pair.value, segs, i + 1, value, path)! })
+                else
+                    list.push(out, pair)
+            if not found
+                let fresh = set_in(YamlMap([]), segs, i + 1, value, path)!
+                list.push(out, YamlPair { key: YamlStr(seg), value: fresh })
+            Ok(YamlMap(out))
+        YamlSeq(items) =>
+            if not is_index(seg)
+                return Err(WrongKind(path_of(segs[0:i + 1]), "map", "seq"))
+            let k = index_of(seg)
+            var out = items[:]
+            if k < list.len(items)
+                out[k] = set_in(items[k], segs, i + 1, value, path)!
+            else
+                list.push(out, set_in(YamlMap([]), segs, i + 1, value, path)!)
+            Ok(YamlSeq(out))
+        _              =>
+            Err(WrongKind(path_of(segs[0:i]), "map", yamlnode.kind_name(v)))
+
+fn remove_in(v: YamlValue, segs: [Str], i: Int, path: Str) -> Result<YamlValue, YamlError>
+    let seg = segs[i]
+    let last = i + 1 == list.len(segs)
+    match v
+        YamlMap(pairs) =>
+            var out: [YamlPair] = []
+            var found = false
+            for pair in pairs
+                var matched = false
+                if let YamlStr(k) = pair.key
+                    matched = k == seg and not found
+                if matched
+                    found = true
+                    if not last
+                        list.push(out, YamlPair { key: pair.key,
+                                                  value: remove_in(pair.value, segs, i + 1, path)! })
+                else
+                    list.push(out, pair)
+            if not found
+                return Err(NoSuchKey(path))
+            Ok(YamlMap(out))
+        YamlSeq(items) =>
+            if not is_index(seg) or index_of(seg) >= list.len(items)
+                return Err(NoSuchKey(path))
+            let k = index_of(seg)
+            var out: [YamlValue] = []
+            for j in 0..list.len(items)
+                if j != k
+                    list.push(out, items[j])
+                elif not last
+                    list.push(out, remove_in(items[j], segs, i + 1, path)!)
+            Ok(YamlSeq(out))
+        _              =>
+            Err(NoSuchKey(path))
+
+fn merged_pairs(base: [YamlPair], overlay: [YamlPair]) -> [YamlPair]
+    var out: [YamlPair] = []
+    for bp in base
+        var value = bp.value
+        for op in overlay
+            if yamlnode.equal(op.key, bp.key)
+                value = merge(bp.value, op.value)
+        list.push(out, YamlPair { key: bp.key, value: value })
+    for op in overlay
+        var known = false
+        for bp in base
+            if yamlnode.equal(op.key, bp.key)
+                known = true
+        if not known
+            list.push(out, op)
+    out

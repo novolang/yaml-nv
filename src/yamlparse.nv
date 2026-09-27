@@ -1,0 +1,1289 @@
+// yamlparse.nv — one YAML document's text into a value tree.
+//
+// The reader splits a stream at its document markers, `---` and `...`
+// at the start of a line, which may not occur inside any scalar
+// (YAML 1.2 section 9.1.4).  This module reads the text of one
+// document, by recursive descent over the productions of chapters 6
+// to 8: block collections by indentation, flow collections by their
+// brackets, and the five scalar styles.  Anchors, aliases, tags and the
+// budgets of `yamlsafe` are applied as the tree is built, so a hostile
+// document is refused before it is expanded.
+//
+// Positions are kept as byte offsets into the document text and turned
+// into a line and a column only when an error is reported.  The line is
+// counted in the stream, not in the document.
+
+use std.str
+use std.list
+use yamlnode
+use yamlerror
+use yamlsafe
+
+// Where a block node sits, which decides what may start it and how far
+// its content is indented.
+fn ctx_top() -> Int
+    0
+
+fn ctx_value() -> Int
+    1
+
+fn ctx_entry() -> Int
+    2
+
+fn ctx_key() -> Int
+    3
+
+// The value after an explicit `:`, which may be a compact collection on
+// the same line, as an entry may.
+fn ctx_explicit() -> Int
+    4
+
+// Whether a node in `ctx` may be a block sequence at its parent's own
+// indentation, as a mapping's value may (section 8.2.1).
+fn compact_seq(ctx: Int) -> Bool
+    ctx == ctx_value() or ctx == ctx_key() or ctx == ctx_explicit()
+
+// The state of one document's parse.
+struct Parser
+    s: Str
+    n: Int
+    // The stream line of the text's first line.
+    first_line: Int
+    // The byte offset of every line of the text.
+    starts: [Int]
+    limits: YamlLimits
+    // The `%TAG` handles the document's directives declared, as
+    // handle to prefix.
+    handles: HashMap<Str, Str>
+    var pos: Int
+    var anchors: HashMap<Str, YamlValue>
+    var sizes: HashMap<Str, Int>
+    var uses: HashMap<Str, Int>
+    var names: [Str]
+    var nodes: Int
+    var depth: Int
+    // The indentation of the block a flow collection or a quoted
+    // scalar sits in: its continuation lines must be indented past it
+    // (section 7.1).
+    var indent: Int
+    // How many flow collections are open.
+    var in_flow: Int
+
+// The properties written before a node: its anchor and its tag, as
+// written, and where the tag was.
+struct Props
+    anchor: Str
+    tag: Str
+    tag_at: Int
+
+fn no_props() -> Props
+    Props { anchor: "", tag: "", tag_at: -1 }
+
+// Parse the text of one document.  `first_line` is the stream line of
+// its first line; the names of the anchors it defines are appended to
+// `names`.
+// `marked` says the text's first line is a `---` line, on which a block
+// collection may not start (section 9.1.4).
+fn parse_doc(text: Str, first_line: Int, handles: HashMap<Str, Str>, limits: YamlLimits,
+             marked: Bool, var names: [Str]) -> Result<YamlValue, YamlError>
+    var starts: [Int] = [0]
+    for i in 0..str.len(text)
+        if str.byte_at_or(text, i, 0) == '\n'
+            list.push(starts, i + 1)
+    var p = Parser { s: text, n: str.len(text), first_line: first_line, starts: starts,
+                     limits: limits, handles: handles, pos: 0, anchors: HashMap.new(),
+                     sizes: HashMap.new(), uses: HashMap.new(), names: [], nodes: 0,
+                     depth: 0, indent: -1, in_flow: 0 }
+    skip_to_content(p)!
+    var v = YamlNull
+    if p.pos < p.n
+        if marked and line_index(p, p.pos) == 0
+            let here = p.pos
+            props(p)!
+            if entry_at(p, p.pos) or key_at(p, p.pos) or at(p, p.pos) == '?' and is_blank(at(p, p.pos + 1))
+                let lc = line_col(p, p.pos)
+                return Err(UnexpectedMappingValue(lc.0, lc.1, "the `---` line"))
+            p.pos = here
+        v = block_node(p, -1, ctx_top(), false)!
+        skip_to_content(p)!
+        if p.pos < p.n
+            return Err(stray(p))
+    else
+        count_node(p, p.pos)!
+    list.append(names, p.names)
+    Ok(v)
+
+// ── Positions and characters ──────────────────────────────────────────
+
+fn at(p: Parser, i: Int) -> Int
+    if i < 0 or i >= p.n
+        return -1
+    str.byte_at_or(p.s, i, -1)
+
+fn line_index(p: Parser, pos: Int) -> Int
+    var lo = 0
+    var hi = list.len(p.starts) - 1
+    for _ in 0..64
+        if lo >= hi
+            break
+        let mid = (lo + hi + 1) / 2
+        if p.starts[mid] <= pos
+            lo = mid
+        else
+            hi = mid - 1
+    lo
+
+// The stream line and the 1-based column of `pos`.
+fn line_col(p: Parser, pos: Int) -> (Int, Int)
+    let k = line_index(p, pos)
+    (p.first_line + k, pos - p.starts[k] + 1)
+
+// The 0-based column of `pos`.
+fn column(p: Parser, pos: Int) -> Int
+    pos - p.starts[line_index(p, pos)]
+
+fn is_blank(b: Int) -> Bool
+    b == ' ' or b == '\t' or b == '\n' or b == '\r' or b < 0
+
+fn is_break(b: Int) -> Bool
+    b == '\n' or b == '\r' or b < 0
+
+fn is_flow_indicator(b: Int) -> Bool
+    b == ',' or b == '[' or b == ']' or b == '{' or b == '}'
+
+// Whether `pos` holds a `#` that starts a comment: at the start of a
+// line or after whitespace.
+fn comment_at(p: Parser, pos: Int) -> Bool
+    at(p, pos) == '#' and (pos == 0 or is_blank(at(p, pos - 1)))
+
+// Skip spaces and tabs on the current line.
+fn skip_space(var p: Parser)
+    for _ in p.pos..p.n
+        let b = at(p, p.pos)
+        if b != ' ' and b != '\t'
+            break
+        p.pos = p.pos + 1
+
+// Skip to the end of the line after a comment or whitespace.  Answers
+// false when something else is on the line.
+fn rest_is_empty(var p: Parser) -> Bool
+    skip_space(p)
+    if comment_at(p, p.pos)
+        for _ in p.pos..p.n
+            if is_break(at(p, p.pos))
+                break
+            p.pos = p.pos + 1
+    is_break(at(p, p.pos))
+
+// Move past blank lines and comments to the next content, which is left
+// at `pos`, or to the end of the text.  A tab in the indentation of a
+// line with content is refused (section 6.1).
+fn skip_to_content(var p: Parser) -> Result<Bool, YamlError>
+    loop
+        if not rest_is_empty(p)
+            return Ok(true)
+        if p.pos >= p.n
+            return Ok(false)
+        p.pos = p.pos + 1
+        // Leading spaces, then a check that no tab stands in for them.
+        for _ in p.pos..p.n
+            if at(p, p.pos) != ' '
+                break
+            p.pos = p.pos + 1
+        // A tab after at least one space of indentation separates the
+        // content rather than indenting it.
+        if at(p, p.pos) == '\t' and p.pos == p.starts[line_index(p, p.pos)]
+            let tab = p.pos
+            skip_space(p)
+            if not is_break(at(p, p.pos)) and not comment_at(p, p.pos)
+                let lc = line_col(p, tab)
+                return Err(TabInIndent(lc.0, lc.1))
+
+fn stray(p: Parser) -> YamlError
+    let lc = line_col(p, p.pos)
+    BadIndent(lc.0, lc.1, 1)
+
+// ── Budgets ───────────────────────────────────────────────────────────
+
+fn count_node(var p: Parser, pos: Int) -> Result<Bool, YamlError>
+    add_nodes(p, pos, 1)
+
+fn add_nodes(var p: Parser, pos: Int, k: Int) -> Result<Bool, YamlError>
+    p.nodes = p.nodes + k
+    if p.nodes > p.limits.max_nodes
+        let lc = line_col(p, pos)
+        return Err(AliasBudgetExceeded(lc.0, lc.1, p.limits.max_nodes))
+    Ok(true)
+
+fn enter(var p: Parser, pos: Int) -> Result<Bool, YamlError>
+    p.depth = p.depth + 1
+    if p.depth > p.limits.max_depth
+        let lc = line_col(p, pos)
+        return Err(TooDeep(lc.0, lc.1, p.limits.max_depth))
+    Ok(true)
+
+fn leave(var p: Parser)
+    p.depth = p.depth - 1
+
+fn scalar_bound(p: Parser, pos: Int, len: Int) -> Result<Bool, YamlError>
+    if len > p.limits.max_scalar_bytes
+        let lc = line_col(p, pos)
+        return Err(BadBlockScalar(lc.0, lc.1,
+                                  "is longer than ${p.limits.max_scalar_bytes} bytes"))
+    Ok(true)
+
+// ── Properties, anchors, aliases and tags ─────────────────────────────
+
+fn name_end(p: Parser, from: Int) -> Int
+    var k = from
+    for _ in from..p.n
+        let b = at(p, k)
+        if is_blank(b) or is_flow_indicator(b)
+            break
+        k = k + 1
+    k
+
+// The anchor and the tag at `pos`, in either order, each followed by
+// whitespace.
+fn props(var p: Parser) -> Result<Props, YamlError>
+    var anchor = ""
+    var tag = ""
+    var tag_at = -1
+    for _ in 0..3
+        let b = at(p, p.pos)
+        if b == '&' and anchor == ""
+            let e = name_end(p, p.pos + 1)
+            anchor = str.slice(p.s, p.pos + 1, e)
+            if anchor == ""
+                let lc = line_col(p, p.pos)
+                return Err(BadTag(lc.0, lc.1, "&"))
+            p.pos = e
+            skip_space(p)
+        elif b == '!' and tag_at < 0
+            tag_at = p.pos
+            let e = tag_end(p, p.pos)
+            tag = str.slice(p.s, p.pos, e)
+            p.pos = e
+            let after = at(p, p.pos)
+            if not (is_blank(after) or p.in_flow > 0 and is_flow_indicator(after))
+                let lc = line_col(p, tag_at)
+                return Err(BadTag(lc.0, lc.1, tag + str.from_byte(after)))
+            check_tag(p, tag, tag_at)!
+            skip_space(p)
+        else
+            break
+    Ok(Props { anchor: anchor, tag: tag, tag_at: tag_at })
+
+fn tag_end(p: Parser, from: Int) -> Int
+    if at(p, from + 1) != '<'
+        return name_end(p, from)
+    // A verbatim tag runs to its `>`, or to whitespace when it has none.
+    var k = from + 2
+    for _ in k..p.n
+        let b = at(p, k)
+        if b == '>'
+            return k + 1
+        if is_blank(b)
+            break
+        k = k + 1
+    k
+
+// Refuse a tag the policy does not honour, and one that names a handle
+// no `%TAG` declared.
+fn check_tag(p: Parser, tag: Str, tag_at: Int) -> Result<Bool, YamlError>
+    let lc = line_col(p, tag_at)
+    if str.starts_with(tag, "!<") and not str.ends_with(tag, ">")
+        return Err(BadTag(lc.0, lc.1, tag))
+    let second = str.index_from(tag, "!", 1) ?? -1
+    if second > 1 and not str.starts_with(tag, "!<")
+        let handle = str.slice(tag, 0, second + 1)
+        if not p.handles.has(handle)
+            return Err(BadTag(lc.0, lc.1, tag))
+    if not yamlsafe.honours_tag(p.limits, tag)
+        return Err(UnsafeTag(lc.0, lc.1, tag))
+    Ok(true)
+
+// The core type a tag names, or "" for an allowed tag that is honoured
+// by being ignored.  A `%TAG` that gives `!!` another prefix makes
+// `!!int` name something other than the core schema's integer.
+fn core_type(p: Parser, tag: Str) -> Str
+    if tag == "!"
+        return "str"
+    if str.starts_with(tag, "!!") and p.handles.has("!!")
+        return ""
+    for name in ["str", "int", "float", "bool", "null", "seq", "map"]
+        if tag == "!!" + name or tag == "tag:yaml.org,2002:" + name
+                or tag == "!<tag:yaml.org,2002:" + name + ">"
+            return name
+    ""
+
+// A scalar's value under its tag: the core schema's resolution for an
+// untagged plain scalar, a string for a quoted one, and the type a core
+// tag names.
+fn scalar_value(p: Parser, text: Str, plain: Bool, pr: Props) -> Result<YamlValue, YamlError>
+    let want = core_type(p, pr.tag)
+    if want == ""
+        let v = if plain
+            yamlnode.resolve(text, SchemaCore)
+        else
+            YamlStr(text)
+        return Ok(v)
+    if want == "str"
+        return Ok(YamlStr(text))
+    let v = yamlnode.resolve(text, SchemaCore)
+    let kind = yamlnode.kind_name(v)
+    if kind == want
+        return Ok(v)
+    if want == "float"
+        if let YamlInt(i) = v
+            return Ok(YamlFloat(i as Float))
+    let lc = line_col(p, pr.tag_at)
+    Err(BadTag(lc.0, lc.1, pr.tag))
+
+// A collection's value under its tag: a core tag must name its kind.
+fn collection_tag(p: Parser, v: YamlValue, pr: Props) -> Result<YamlValue, YamlError>
+    let want = core_type(p, pr.tag)
+    if want == "" or want == yamlnode.kind_name(v)
+        return Ok(v)
+    let lc = line_col(p, pr.tag_at)
+    Err(BadTag(lc.0, lc.1, pr.tag))
+
+// Bind a node to its anchor, when it has one.
+fn anchored(var p: Parser, v: YamlValue, pr: Props) -> YamlValue
+    if pr.anchor != ""
+        p.anchors.set(pr.anchor, v)
+        p.sizes.set(pr.anchor, yamlnode.node_count(v))
+        p.uses.set(pr.anchor, 0)
+        if not list.contains(p.names, pr.anchor)
+            list.push(p.names, pr.anchor)
+    v
+
+// An alias at `pos`: the node its anchor bound, counted against both
+// alias budgets.
+fn alias_node(var p: Parser) -> Result<YamlValue, YamlError>
+    let start = p.pos
+    let e = name_end(p, p.pos + 1)
+    let name = str.slice(p.s, p.pos + 1, e)
+    p.pos = e
+    let lc = line_col(p, start)
+    if not p.limits.allow_aliases
+        return Err(AliasRepeatExceeded(lc.0, lc.1, name, 0))
+    if not p.anchors.has(name)
+        return Err(UnknownAnchor(lc.0, lc.1, name))
+    let used = (p.uses.get(name) ?? 0) + 1
+    if used > p.limits.max_alias_uses
+        return Err(AliasRepeatExceeded(lc.0, lc.1, name, p.limits.max_alias_uses))
+    p.uses.set(name, used)
+    add_nodes(p, start, p.sizes.get(name) ?? 1)!
+    let v = p.anchors.get(name) ?? YamlNull
+    Ok(v)
+
+// ── Block nodes (chapter 8) ───────────────────────────────────────────
+
+// A block node whose content starts at `pos`, inside a parent indented
+// to `n`.
+fn block_node(var p: Parser, n: Int, ctx: Int, same_line: Bool) -> Result<YamlValue, YamlError>
+    let start = p.pos
+    var pr = props(p)!
+    var inline = same_line
+    var moved = false
+    // Properties may end a line and go on over the next ones, before
+    // the content (section 6.9).
+    for _ in 0..3
+        if pr.anchor == "" and pr.tag == ""
+            break
+        if not (is_break(at(p, p.pos)) or comment_at(p, p.pos))
+            if key_at(p, p.pos) and not moved
+                // Properties before an implicit key on the key's own
+                // line belong to the key (section 8.2.2).
+                return block_mapping(p, column(p, start), pr)
+            break
+        inline = false
+        moved = true
+        let more = skip_to_content(p)!
+        let col = column(p, p.pos)
+        let seq_here = col == n and compact_seq(ctx) and entry_at(p, p.pos)
+        if not more or col <= n and not seq_here
+            count_node(p, start)!
+            let empty = scalar_value(p, "", true, pr)!
+            return Ok(anchored(p, empty, pr))
+        if key_at(p, p.pos)
+            break
+        pr = more_props(p, pr)!
+    let col = column(p, p.pos)
+    let c = at(p, p.pos)
+    if entry_at(p, p.pos)
+        if ctx == ctx_value() and inline or p.pos != start and not moved
+            let lc = line_col(p, p.pos)
+            return Err(UnexpectedSequenceEntry(lc.0, lc.1, "a mapping value on its key's line"))
+        let v = block_sequence(p, col)!
+        return Ok(anchored(p, collection_tag(p, v, pr)!, pr))
+    if c == '?' and is_blank(at(p, p.pos + 1)) or key_at(p, p.pos)
+        if ctx == ctx_value() and inline
+            let lc = line_col(p, p.pos)
+            return Err(UnexpectedMappingValue(lc.0, lc.1, "a mapping value on its key's line"))
+        let v = block_mapping(p, col, no_props())!
+        return Ok(anchored(p, collection_tag(p, v, pr)!, pr))
+    if c == '|' or c == '>'
+        count_node(p, p.pos)!
+        let text = block_scalar(p, n)!
+        let v = scalar_value(p, text, false, pr)!
+        return Ok(anchored(p, v, pr))
+    if c == '*'
+        if pr.anchor != "" or pr.tag != ""
+            let lc = line_col(p, p.pos)
+            return Err(BadTag(lc.0, lc.1, "*"))
+        return alias_node(p)
+    let v = flow_or_scalar(p, n, pr)!
+    Ok(anchored(p, v, pr))
+
+// The properties a node's first line left out, read from the line its
+// content starts on.
+fn more_props(var p: Parser, pr: Props) -> Result<Props, YamlError>
+    let at_line = p.pos
+    let more = props(p)!
+    if pr.anchor != "" and more.anchor != ""
+        let lc = line_col(p, at_line)
+        return Err(BadTag(lc.0, lc.1, "&" + more.anchor))
+    let anchor = if pr.anchor != ""
+        pr.anchor
+    else
+        more.anchor
+    if pr.tag_at >= 0
+        return Ok(Props { anchor: anchor, tag: pr.tag, tag_at: pr.tag_at })
+    Ok(Props { anchor: anchor, tag: more.tag, tag_at: more.tag_at })
+
+// A flow collection or a scalar in block context.
+fn flow_or_scalar(var p: Parser, n: Int, pr: Props) -> Result<YamlValue, YamlError>
+    p.indent = n
+    let c = at(p, p.pos)
+    if c == '[' or c == '{'
+        let v = flow_collection(p)!
+        return collection_tag(p, v, pr)
+    count_node(p, p.pos)!
+    if c == '"' or c == '\''
+        let text = quoted(p)!
+        return scalar_value(p, text, false, pr)
+    let text = plain(p, n, false)!
+    scalar_value(p, text, true, pr)
+
+// Whether `pos` is a block sequence entry: `-` followed by whitespace.
+fn entry_at(p: Parser, pos: Int) -> Bool
+    at(p, pos) == '-' and is_blank(at(p, pos + 1))
+
+// Whether an implicit key starts at `pos`: a node on this line followed
+// by `:` and whitespace.
+fn key_at(p: Parser, pos: Int) -> Bool
+    colon_after_key(p, pos) >= 0
+
+// The position of the `:` after an implicit key at `pos`, or -1.
+fn colon_after_key(p: Parser, pos: Int) -> Int
+    var k = pos
+    let c = at(p, k)
+    if c == '"' or c == '\''
+        k = quote_end_on_line(p, k)
+        if k < 0
+            return -1
+    elif c == '[' or c == '{'
+        k = bracket_end_on_line(p, k)
+        if k < 0
+            return -1
+    elif c == '*' or c == '&' or c == '!'
+        k = name_end(p, k + 1)
+        if c != '*'
+            for _ in k..p.n
+                if at(p, k) != ' ' and at(p, k) != '\t'
+                    break
+                k = k + 1
+            return colon_after_key(p, k)
+    elif c == ':' and is_blank(at(p, k + 1))
+        // An empty key (section 8.2.2): the `:` alone.
+        return k
+    elif is_blank(c) or c == '#' or c == '|' or c == '>' or c == '%' or c == '@' or c == '`'
+            or (c == '-' or c == '?') and is_blank(at(p, k + 1))
+        return -1
+    else
+        for _ in k..p.n
+            let b = at(p, k)
+            if is_break(b) or b == ':' and is_blank(at(p, k + 1)) or comment_at(p, k)
+                break
+            k = k + 1
+        if at(p, k) == ':'
+            return k
+        return -1
+    for _ in k..p.n
+        if at(p, k) != ' ' and at(p, k) != '\t'
+            break
+        k = k + 1
+    if at(p, k) == ':' and (is_blank(at(p, k + 1)) or c == '"' or c == '\'' or c == '[' or c == '{')
+        return k
+    -1
+
+fn quote_end_on_line(p: Parser, pos: Int) -> Int
+    let q = at(p, pos)
+    var k = pos + 1
+    var end = -1
+    for _ in k..p.n
+        let b = at(p, k)
+        if is_break(b)
+            break
+        if q == '"' and b == '\\'
+            k = k + 2
+            continue
+        if b == q and not (q == '\'' and at(p, k + 1) == '\'')
+            end = k + 1
+            break
+        k = k + (if b == q then 2 else 1)
+    end
+
+fn bracket_end_on_line(p: Parser, pos: Int) -> Int
+    var depth = 0
+    var k = pos
+    var end = -1
+    for _ in pos..p.n
+        let b = at(p, k)
+        if b == '"' or b == '\''
+            k = quote_end_on_line(p, k)
+        elif is_break(b)
+            break
+        else
+            if b == '[' or b == '{'
+                depth = depth + 1
+            elif b == ']' or b == '}'
+                depth = depth - 1
+            k = k + 1
+            if depth == 0
+                end = k
+                break
+        if k < 0
+            break
+    end
+
+// A block sequence whose entries start at column `m` (section 8.2.1).
+fn block_sequence(var p: Parser, m: Int) -> Result<YamlValue, YamlError>
+    enter(p, p.pos)!
+    count_node(p, p.pos)!
+    var items: [YamlValue] = []
+    for _ in 0..p.n + 1
+        p.pos = p.pos + 1
+        no_tab_before_block(p)!
+        var item = YamlNull
+        if is_break(at(p, p.pos)) or comment_at(p, p.pos)
+            let more = skip_to_content(p)!
+            if more and column(p, p.pos) > m
+                item = block_node(p, m, ctx_entry(), false)!
+            else
+                count_node(p, p.pos)!
+        else
+            item = block_node(p, m, ctx_entry(), true)!
+        list.push(items, item)
+        if not skip_to_content(p)!
+            break
+        let col = column(p, p.pos)
+        if col < m
+            break
+        if col > m
+            let lc = line_col(p, p.pos)
+            return Err(BadIndent(lc.0, lc.1, m + 1))
+        if not entry_at(p, p.pos)
+            break
+    leave(p)
+    Ok(YamlSeq(items))
+
+// A block mapping whose keys start at column `m` (section 8.2.2).
+// `first` holds the properties already read before the first key.
+fn block_mapping(var p: Parser, m: Int, first: Props) -> Result<YamlValue, YamlError>
+    enter(p, p.pos)!
+    count_node(p, p.pos)!
+    var pairs: [YamlPair] = []
+    var key_lines: [Int] = []
+    var pending = first
+    for _ in 0..p.n + 1
+        let key_pos = p.pos
+        var key = YamlNull
+        var value = YamlNull
+        if at(p, p.pos) == '?' and is_blank(at(p, p.pos + 1)) and pending.tag_at < 0
+                and pending.anchor == ""
+            p.pos = p.pos + 1
+            key = entry_value(p, m, ctx_key())!
+            if skip_to_content(p)! and column(p, p.pos) == m and at(p, p.pos) == ':'
+                    and is_blank(at(p, p.pos + 1))
+                p.pos = p.pos + 1
+                // After an explicit `:` the value may be a compact
+                // collection on the same line, as after a `-`.
+                value = entry_value(p, m, ctx_explicit())!
+            else
+                count_node(p, p.pos)!
+        else
+            key = implicit_key(p, m, pending)!
+            p.pos = p.pos + 1
+            value = entry_value(p, m, ctx_value())!
+        pending = no_props()
+        check_key(p, key, key_pos, pairs, key_lines)!
+        list.push(pairs, YamlPair { key: key, value: value })
+        list.push(key_lines, line_col(p, key_pos).0)
+        if not skip_to_content(p)!
+            break
+        let col = column(p, p.pos)
+        if col < m
+            break
+        if col > m
+            let lc = line_col(p, p.pos)
+            return Err(BadIndent(lc.0, lc.1, m + 1))
+        if entry_at(p, p.pos)
+            let lc = line_col(p, p.pos)
+            return Err(UnexpectedSequenceEntry(lc.0, lc.1, "a mapping"))
+        if not key_at(p, p.pos) and not (at(p, p.pos) == '?' and is_blank(at(p, p.pos + 1)))
+            let lc = line_col(p, p.pos)
+            return Err(UnexpectedMappingValue(lc.0, lc.1, "a mapping without a key"))
+    leave(p)
+    Ok(YamlMap(pairs))
+
+// Skip the whitespace after an indicator, refusing a tab in it when a
+// block collection follows on the same line: the tab would be its
+// indentation (section 6.1).
+fn no_tab_before_block(var p: Parser) -> Result<Bool, YamlError>
+    var tab = -1
+    for _ in p.pos..p.n
+        let b = at(p, p.pos)
+        if b == '\t' and tab < 0
+            tab = p.pos
+        if b != ' ' and b != '\t'
+            break
+        p.pos = p.pos + 1
+    if tab >= 0 and (entry_at(p, p.pos) or key_at(p, p.pos)
+            or at(p, p.pos) == '?' and is_blank(at(p, p.pos + 1)))
+        let lc = line_col(p, tab)
+        return Err(TabInIndent(lc.0, lc.1))
+    Ok(true)
+
+// The value after a `:`, a `?` or a `-` has been passed: on the same
+// line, on the lines after it indented past `m`, or a sequence at `m`
+// itself when it is a mapping's value.
+fn entry_value(var p: Parser, m: Int, ctx: Int) -> Result<YamlValue, YamlError>
+    no_tab_before_block(p)!
+    if is_break(at(p, p.pos)) or comment_at(p, p.pos)
+        let more = skip_to_content(p)!
+        let col = column(p, p.pos)
+        if more and (col > m or col == m and compact_seq(ctx) and entry_at(p, p.pos))
+            return block_node(p, m, ctx, false)
+        count_node(p, p.pos)!
+        return Ok(YamlNull)
+    block_node(p, m, ctx, true)
+
+// An implicit key and its properties, left at its `:`.
+fn implicit_key(var p: Parser, m: Int, pending: Props) -> Result<YamlValue, YamlError>
+    var pr = pending
+    if pr.tag_at < 0 and pr.anchor == ""
+        pr = props(p)!
+    let c = at(p, p.pos)
+    p.indent = m
+    var key = YamlNull
+    if c == '*'
+        if pr.anchor != "" or pr.tag != ""
+            let lc = line_col(p, p.pos)
+            return Err(BadTag(lc.0, lc.1, "*"))
+        key = alias_node(p)!
+    elif c == '[' or c == '{'
+        key = collection_tag(p, flow_collection(p)!, pr)!
+    elif c == '"' or c == '\''
+        count_node(p, p.pos)!
+        key = scalar_value(p, quoted(p)!, false, pr)!
+    else
+        count_node(p, p.pos)!
+        key = scalar_value(p, plain_key(p), true, pr)!
+    key = anchored(p, key, pr)
+    skip_space(p)
+    Ok(key)
+
+// A plain implicit key: the text up to its `:`.
+fn plain_key(var p: Parser) -> Str
+    let start = p.pos
+    let colon = colon_after_key(p, p.pos)
+    var e = colon
+    for _ in start..colon
+        if at(p, e - 1) != ' ' and at(p, e - 1) != '\t'
+            break
+        e = e - 1
+    p.pos = colon
+    str.slice(p.s, start, e)
+
+// Refuse the same key twice and, unless the policy allows one, a key
+// that is a collection.
+fn check_key(p: Parser, key: YamlValue, pos: Int, pairs: [YamlPair],
+             lines: [Int]) -> Result<Bool, YamlError>
+    let lc = line_col(p, pos)
+    let k = yamlnode.kind_of(key)
+    if (k == KindMap or k == KindSeq) and not p.limits.allow_complex_keys
+        return Err(ComplexKey(lc.0, lc.1))
+    for i in 0..list.len(pairs)
+        if yamlnode.equal(pairs[i].key, key)
+            return Err(DuplicateKey(lc.0, lc.1, key_text(key), lines[i]))
+    Ok(true)
+
+fn key_text(key: YamlValue) -> Str
+    match key
+        YamlStr(s)   => s
+        YamlInt(i)   => "${i}"
+        YamlBool(b)  => str.from_bool(b)
+        YamlFloat(f) => str.from_float(f)
+        YamlNull     => "null"
+        _            => yamlnode.kind_name(key)
+
+// ── Block scalars (section 8.1) ───────────────────────────────────────
+
+// The line starting at `pos` and where it ends.
+fn line_end(p: Parser, pos: Int) -> Int
+    var k = pos
+    for _ in pos..p.n
+        if is_break(at(p, k))
+            break
+        k = k + 1
+    k
+
+fn blank_between(p: Parser, a: Int, e: Int) -> Bool
+    for k in a..e
+        if at(p, k) != ' ' and at(p, k) != '\t'
+            return false
+    true
+
+fn leading_spaces(p: Parser, pos: Int) -> Int
+    var k = 0
+    for _ in pos..p.n
+        if at(p, pos + k) != ' '
+            break
+        k = k + 1
+    k
+
+// A literal or folded block scalar whose header is at `pos`, in a
+// parent indented to `n`.
+fn block_scalar(var p: Parser, n: Int) -> Result<Str, YamlError>
+    let head = p.pos
+    let folded = at(p, p.pos) == '>'
+    p.pos = p.pos + 1
+    var chomp = 0
+    var explicit = 0
+    for _ in 0..2
+        let b = at(p, p.pos)
+        if (b == '-' or b == '+') and chomp == 0
+            chomp = if b == '-'
+                -1
+            else
+                1
+            p.pos = p.pos + 1
+        elif b >= '1' and b <= '9' and explicit == 0
+            explicit = b - '0'
+            p.pos = p.pos + 1
+    if not is_blank(at(p, p.pos)) or not rest_is_empty(p)
+        let lc = line_col(p, head)
+        return Err(BadBlockScalar(lc.0, lc.1, "header has text after its indicators"))
+    let base = if n < 0
+        0
+    else
+        n + 1
+    var indent = if explicit > 0
+        (if n < 0 then 0 else n) + explicit
+    else
+        -1
+    // Find the content's indentation from its first non-empty line.
+    var k = if p.pos < p.n
+        p.pos + 1
+    else
+        p.n
+    var widest_empty = 0
+    var widest_line = 0
+    if indent < 0
+        for _ in 0..p.n + 1
+            if k >= p.n
+                break
+            let sp = leading_spaces(p, k)
+            let e = line_end(p, k)
+            if k + sp < e
+                indent = sp
+                break
+            if sp > widest_empty
+                widest_empty = sp
+                widest_line = k
+            k = e + 1
+        if indent < 0
+            indent = if widest_empty > base
+                widest_empty
+            else
+                base
+        if indent < base
+            indent = base
+        if widest_empty > indent
+            let lc = line_col(p, widest_line)
+            return Err(BadBlockScalar(lc.0, lc.1, "has a leading empty line indented past its first line"))
+    // Read the lines that belong to it.
+    var lines: [Str] = []
+    var line_at = if p.pos < p.n
+        p.pos + 1
+    else
+        p.n
+    var end_at = line_at
+    for _ in 0..p.n + 1
+        if line_at >= p.n
+            break
+        let e = line_end(p, line_at)
+        let sp = leading_spaces(p, line_at)
+        if sp < indent and at(p, line_at + sp) == '\t' and blank_between(p, line_at + sp, e)
+            let lc = line_col(p, line_at + sp)
+            return Err(BadBlockScalar(lc.0, lc.1, "has a tab where its indentation belongs"))
+        if sp >= indent
+            list.push(lines, str.slice(p.s, line_at + indent, e))
+        elif line_at + sp >= e
+            list.push(lines, "")
+        else
+            break
+        end_at = if e < p.n
+            e + 1
+        else
+            e
+        line_at = end_at
+    p.pos = if end_at > p.pos
+        end_at - 1
+    else
+        p.pos
+    let text = if folded
+        fold_lines(lines)
+    else
+        literal_lines(lines)
+    let out = chomped(text, lines, chomp)
+    scalar_bound(p, head, str.len(out))!
+    Ok(out)
+
+// The last non-empty line, or -1.
+fn last_content(lines: [Str]) -> Int
+    var last = -1
+    for i in 0..list.len(lines)
+        if lines[i] != ""
+            last = i
+    last
+
+fn literal_lines(lines: [Str]) -> Str
+    let last = last_content(lines)
+    str.join(lines[0:last + 1], "\n")
+
+// Folding (section 8.1.3): a line break between two lines of text is a
+// space, and every empty line between them is a line feed; a line that
+// starts with whitespace keeps its break.
+fn fold_lines(lines: [Str]) -> Str
+    let last = last_content(lines)
+    var parts: [Str] = []
+    var empties = 0
+    var prev_text = false
+    var prev_more = false
+    for i in 0..last + 1
+        let l = lines[i]
+        if l == ""
+            empties = empties + 1
+            continue
+        let more = str.starts_with(l, " ") or str.starts_with(l, "\t")
+        if prev_text
+            if prev_more or more
+                list.push(parts, str.repeat("\n", empties + 1))
+            elif empties > 0
+                list.push(parts, str.repeat("\n", empties))
+            else
+                list.push(parts, " ")
+        else
+            list.push(parts, str.repeat("\n", empties))
+        list.push(parts, l)
+        empties = 0
+        prev_text = true
+        prev_more = more
+    str.join(parts, "")
+
+// Chomping (section 8.1.1.2): strip no line break, clip one, keep all.
+fn chomped(text: Str, lines: [Str], chomp: Int) -> Str
+    let last = last_content(lines)
+    if chomp < 0
+        return text
+    if chomp == 0
+        return if last >= 0 then text + "\n" else ""
+    let trailing = list.len(lines) - last - 1
+    if last < 0
+        return str.repeat("\n", trailing)
+    text + str.repeat("\n", trailing + 1)
+
+// ── Plain scalars (section 7.3.3) ─────────────────────────────────────
+
+// A plain scalar at `pos`.  In block context it continues on following
+// lines indented past `n`; in flow context it continues until a flow
+// indicator.  Line breaks fold as in a quoted scalar.
+fn plain(var p: Parser, n: Int, flow: Bool) -> Result<Str, YamlError>
+    let start = p.pos
+    // An indicator cannot start a plain scalar, and `-`, `?` and `:`
+    // start one only before a character that could follow them in it
+    // (section 7.3.3).
+    let first = at(p, start)
+    let second = at(p, start + 1)
+    if str.contains("#,[]{}&*!|>'\"%@`", str.from_byte(first))
+            or (first == '-' or first == '?' or first == ':')
+                and (is_blank(second) or flow and is_flow_indicator(second))
+        let lc = line_col(p, start)
+        return Err(UnexpectedByte(lc.0, lc.1, first))
+    var parts: [Str] = []
+    var line_start = p.pos
+    for _ in 0..p.n + 1
+        var k = line_start
+        var e = line_start
+        for _ in line_start..p.n
+            let b = at(p, k)
+            if is_break(b) or comment_at(p, k)
+                break
+            if b == ':' and (is_blank(at(p, k + 1)) or flow and is_flow_indicator(at(p, k + 1)))
+                break
+            if flow and is_flow_indicator(b)
+                break
+            k = k + 1
+            if b != ' ' and b != '\t'
+                e = k
+        list.push(parts, str.slice(p.s, line_start, e))
+        p.pos = e
+        let stop = at(p, k)
+        if not is_break(stop)
+            if stop == ':' and not flow and k > start
+                let lc = line_col(p, k)
+                return Err(UnexpectedMappingValue(lc.0, lc.1, "a plain scalar"))
+            break
+        // Look past the line break for a continuation.
+        var next = k
+        var breaks = 0
+        for _ in k..p.n
+            // `next` is at a line break: step past it and the next
+            // line's whitespace.
+            next = next + 1
+            breaks = breaks + 1
+            for _ in next..p.n
+                if at(p, next) != ' ' and at(p, next) != '\t'
+                    break
+                next = next + 1
+            if not is_break(at(p, next)) or next >= p.n
+                break
+        if next >= p.n or comment_at(p, next) or not flow and column(p, next) <= n
+            break
+        // A line that reads as a key belongs to the block around the
+        // scalar, which then decides whether it is indented where one
+        // may be.
+        if not flow and key_at(p, next)
+            break
+        if flow
+            continuation(p, next)!
+        if flow and (is_flow_indicator(at(p, next)) or at(p, next) == ':')
+            break
+        list.push(parts, (if breaks > 1 then str.repeat("\n", breaks - 1) else " "))
+        line_start = next
+    let out = str.join(parts, "")
+    scalar_bound(p, start, str.len(out))!
+    Ok(out)
+
+// ── Quoted scalars (sections 7.3.1 and 7.3.2) ─────────────────────────
+
+// A single- or double-quoted scalar at `pos`, with its escapes decoded
+// and its line breaks folded.
+fn quoted(var p: Parser) -> Result<Str, YamlError>
+    let open = p.pos
+    let q = at(p, open)
+    var parts: [Str] = []
+    var k = open + 1
+    var run = k
+    loop
+        let b = at(p, k)
+        if b < 0
+            let lc = line_col(p, open)
+            return Err(UnterminatedQuote(lc.0, lc.1))
+        if b == q
+            if q == '\'' and at(p, k + 1) == '\''
+                list.push(parts, str.slice(p.s, run, k + 1))
+                k = k + 2
+                run = k
+                continue
+            list.push(parts, str.slice(p.s, run, k))
+            p.pos = k + 1
+            let out = str.join(parts, "")
+            scalar_bound(p, open, str.len(out))!
+            return Ok(out)
+        if q == '"' and b == '\\'
+            list.push(parts, str.slice(p.s, run, k))
+            if is_break(at(p, k + 1))
+                // An escaped line break joins the lines with nothing
+                // between them.
+                k = skip_line_start(p, k + 1)
+            else
+                list.push(parts, escape(p, k)!)
+                k = k + escape_len(at(p, k + 1))
+            run = k
+            continue
+        if is_break(b)
+            // Trailing whitespace before a line break is not content.
+            var e = k
+            for _ in run..k
+                if at(p, e - 1) != ' ' and at(p, e - 1) != '\t'
+                    break
+                e = e - 1
+            list.push(parts, str.slice(p.s, run, e))
+            var breaks = 0
+            var next = k
+            for _ in k..p.n
+                if not is_break(at(p, next))
+                    break
+                breaks = breaks + 1
+                next = skip_line_start(p, next)
+            continuation(p, next)!
+            list.push(parts, (if breaks > 1 then str.repeat("\n", breaks - 1) else " "))
+            k = next
+            run = k
+            continue
+        if p.limits.max_scalar_bytes > 0 and k - open > p.limits.max_scalar_bytes
+            let lc = line_col(p, open)
+            return Err(UnterminatedQuote(lc.0, lc.1))
+        k = k + 1
+
+// Refuse the content at `pos`, on a continuation line of a flow
+// collection or a quoted scalar, when the spaces before it do not
+// indent it past the block around it (section 7.1).  A tab does not
+// count as indentation.
+fn continuation(p: Parser, pos: Int) -> Result<Bool, YamlError>
+    if p.indent < 0 or pos >= p.n
+        return Ok(true)
+    let line = p.starts[line_index(p, pos)]
+    let spaces = leading_spaces(p, line)
+    if spaces <= p.indent
+        let lc = line_col(p, line + spaces)
+        return Err(BadIndent(lc.0, lc.1, p.indent + 2))
+    Ok(true)
+
+// Past the line break at `pos` and the next line's leading whitespace.
+fn skip_line_start(p: Parser, pos: Int) -> Int
+    var k = pos
+    if at(p, k) == '\r'
+        k = k + 1
+    if at(p, k) == '\n'
+        k = k + 1
+    for _ in k..p.n
+        if at(p, k) != ' ' and at(p, k) != '\t'
+            break
+        k = k + 1
+    k
+
+// How many bytes the escape whose letter is `c` takes, backslash
+// included.
+fn escape_len(c: Int) -> Int
+    if c == 'x'
+        4
+    elif c == 'u'
+        6
+    elif c == 'U'
+        10
+    else
+        2
+
+// The text of the escape at `pos`, the backslash (section 5.7).
+fn escape(p: Parser, pos: Int) -> Result<Str, YamlError>
+    let c = at(p, pos + 1)
+    let simple = simple_escape(c)
+    if simple >= 0
+        return Ok(str.from_char(simple))
+    let width = escape_len(c) - 2
+    if width > 0
+        var v = 0
+        for i in 0..width
+            let d = hex_digit(at(p, pos + 2 + i))
+            if d < 0
+                return Err(bad_escape(p, pos, pos + 3 + i))
+            v = v * 16 + d
+        if v >= 0xD800 and v <= 0xDFFF or v > 0x10FFFF
+            return Err(bad_escape(p, pos, pos + 2 + width))
+        return Ok(str.from_char(v))
+    Err(bad_escape(p, pos, pos + 2))
+
+fn bad_escape(p: Parser, pos: Int, end: Int) -> YamlError
+    let lc = line_col(p, pos)
+    let e = if end > p.n
+        p.n
+    else
+        end
+    BadEscape(lc.0, lc.1, str.slice(p.s, pos, e))
+
+fn simple_escape(c: Int) -> Int
+    if c == '0'
+        0
+    elif c == 'a'
+        7
+    elif c == 'b'
+        8
+    elif c == 't' or c == '\t'
+        9
+    elif c == 'n'
+        10
+    elif c == 'v'
+        11
+    elif c == 'f'
+        12
+    elif c == 'r'
+        13
+    elif c == 'e'
+        27
+    elif c == ' ' or c == '"' or c == '/' or c == '\\'
+        c
+    elif c == 'N'
+        0x85
+    elif c == '_'
+        0xA0
+    elif c == 'L'
+        0x2028
+    elif c == 'P'
+        0x2029
+    else
+        -1
+
+fn hex_digit(b: Int) -> Int
+    if b >= '0' and b <= '9'
+        b - '0'
+    elif b >= 'a' and b <= 'f'
+        b - 'a' + 10
+    elif b >= 'A' and b <= 'F'
+        b - 'A' + 10
+    else
+        -1
+
+// ── Flow collections (section 7.4) ────────────────────────────────────
+
+// Skip whitespace, line breaks and comments inside a flow collection,
+// and answer whether a line break was crossed.  Content on a new line
+// must be indented past the block around the collection.
+fn skip_flow_space(var p: Parser) -> Result<Bool, YamlError>
+    var crossed = false
+    for _ in p.pos..p.n + 1
+        let b = at(p, p.pos)
+        if b == '\n' or b == '\r'
+            crossed = true
+            p.pos = p.pos + 1
+        elif b == ' ' or b == '\t'
+            p.pos = p.pos + 1
+        elif comment_at(p, p.pos)
+            for _ in p.pos..p.n
+                if is_break(at(p, p.pos))
+                    break
+                p.pos = p.pos + 1
+        else
+            break
+    if crossed
+        continuation(p, p.pos)!
+    Ok(crossed)
+
+// A flow sequence or mapping at `pos`.
+fn flow_collection(var p: Parser) -> Result<YamlValue, YamlError>
+    let open = p.pos
+    let is_seq = at(p, open) == '['
+    let close = if is_seq
+        ']'
+    else
+        '}'
+    enter(p, open)!
+    count_node(p, open)!
+    p.pos = p.pos + 1
+    p.in_flow = p.in_flow + 1
+    var items: [YamlValue] = []
+    var pairs: [YamlPair] = []
+    var lines: [Int] = []
+    for _ in 0..p.n + 1
+        skip_flow_space(p)!
+        let b = at(p, p.pos)
+        if b < 0
+            let lc = line_col(p, open)
+            return Err(UnterminatedFlow(lc.0, lc.1))
+        if b == close
+            p.pos = p.pos + 1
+            break
+        if b == ']' or b == '}' or b == ','
+            let lc = line_col(p, p.pos)
+            return Err(UnexpectedFlowClose(lc.0, lc.1))
+        let entry_pos = p.pos
+        var explicit = false
+        if b == '?' and is_blank(at(p, p.pos + 1))
+            explicit = true
+            p.pos = p.pos + 1
+            skip_flow_space(p)!
+        var key = YamlNull
+        let kb = at(p, p.pos)
+        if not (kb == ':' and flow_colon(p, p.pos)) and not (explicit and (kb == ',' or kb == close))
+            key = flow_node(p)!
+        else
+            count_node(p, p.pos)!
+        let key_end = p.pos
+        let crossed = skip_flow_space(p)!
+        // In a flow sequence a pair's implicit key stays on one line
+        // (section 7.4.1).
+        if is_seq and crossed and not explicit and at(p, p.pos) == ':'
+            let lc = line_col(p, key_end)
+            return Err(UnexpectedMappingValue(lc.0, lc.1, "a flow sequence after a line break"))
+        var has_value = false
+        var value = YamlNull
+        if at(p, p.pos) == ':'
+            has_value = true
+            p.pos = p.pos + 1
+            skip_flow_space(p)!
+            let vb = at(p, p.pos)
+            if vb == ',' or vb == close
+                count_node(p, p.pos)!
+            else
+                value = flow_node(p)!
+            skip_flow_space(p)!
+        if is_seq and not has_value and not explicit
+            list.push(items, key)
+        else
+            if not has_value
+                count_node(p, p.pos)!
+            check_key(p, key, entry_pos, pairs, lines)!
+            let pair = YamlPair { key: key, value: value }
+            if is_seq
+                count_node(p, entry_pos)!
+                list.push(items, YamlMap([pair]))
+            else
+                list.push(pairs, pair)
+                list.push(lines, line_col(p, entry_pos).0)
+        let after = at(p, p.pos)
+        if after == ','
+            p.pos = p.pos + 1
+        elif after != close
+            if after < 0
+                let lc = line_col(p, open)
+                return Err(UnterminatedFlow(lc.0, lc.1))
+            let lc = line_col(p, p.pos)
+            return Err(UnexpectedFlowClose(lc.0, lc.1))
+    leave(p)
+    p.in_flow = p.in_flow - 1
+    if is_seq
+        return Ok(YamlSeq(items))
+    Ok(YamlMap(pairs))
+
+// Whether a `:` in a flow collection is a value indicator rather than
+// the start of a plain scalar such as `::vector`: it is followed by
+// whitespace or a flow indicator.
+fn flow_colon(p: Parser, pos: Int) -> Bool
+    let next = at(p, pos + 1)
+    is_blank(next) or is_flow_indicator(next)
+
+// A node inside a flow collection.
+fn flow_node(var p: Parser) -> Result<YamlValue, YamlError>
+    let pr = props(p)!
+    skip_flow_space(p)!
+    let c = at(p, p.pos)
+    if c == '*'
+        return alias_node(p)
+    var v = YamlNull
+    if c == '[' or c == '{'
+        v = collection_tag(p, flow_collection(p)!, pr)!
+    elif c == '"' or c == '\''
+        count_node(p, p.pos)!
+        v = scalar_value(p, quoted(p)!, false, pr)!
+    elif c == ',' or c == ']' or c == '}' or c < 0 or c == ':' and flow_colon(p, p.pos)
+        count_node(p, p.pos)!
+        v = scalar_value(p, "", true, pr)!
+    else
+        count_node(p, p.pos)!
+        v = scalar_value(p, plain(p, -1, true)!, true, pr)!
+    Ok(anchored(p, v, pr))

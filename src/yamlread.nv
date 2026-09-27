@@ -1,70 +1,41 @@
 // yamlread.nv — the reader: a feed-and-drain state machine, and the
 // direct forms written on top of it.
 //
-// WHY THIS ONE HAS A FEED-AND-DRAIN READER AND toml-nv DOES NOT
+// A YAML stream is a sequence of documents, and each one is complete
+// when its terminator arrives: a `---` that starts the next, a `...`,
+// or the end of the stream.  A document marker at the start of a line
+// cannot occur inside any scalar (YAML 1.2 section 9.1.4), so the
+// reader splits the stream at those lines and parses each document as
+// it completes.  `feed` therefore hands back finished documents while
+// the rest of the stream is still arriving:
 //
-// The difference is where a document ends.  A TOML document is not
-// complete until its last line, because a `[table]` header at the
-// bottom can add keys to a table defined at the top — so a
-// chunk-at-a-time TOML reader would buffer the whole file and only be
-// lying about it in its type.  A YAML STREAM is a sequence of
-// documents separated by `---`, and each one is complete when its
-// terminator arrives.  So a `feed` here can hand back finished
-// documents while the rest of the stream is still coming, which is
-// exactly what a caller tailing a Kubernetes manifest stream, reading
-// a multi-document config from a pipe, or parsing a log of YAML
-// records wants.  The shape is honest in both packages because in both
-// it matches what the format allows.
+//     let r = yamlread.reader(yamlsafe.standard())
+//     let fed = yamlread.feed(r, chunk)       // as many times as you like
+//     let rest = yamlread.finish(fed.0)!      // once, at end of stream
 //
-//     var r = yamlread.reader(yamlsafe.standard())
-//     let (r2, docs) = yamlread.feed(r, chunk)   // as many times as you like
-//     let rest = yamlread.finish(r2)!            // once, at end of stream
+// A chunk may split anything: a line, a UTF-8 sequence, a `---` between
+// its dashes.  The reader carries what it could not finish into the next
+// call, and `feed` answers a new reader rather than changing the one it
+// was given.
 //
-// A chunk may split anything — a line, a quoted scalar containing a
-// newline, a `---` between the second and third dash — and the reader
-// carries whatever it could not finish into the next call.  `feed`
-// returns a NEW reader rather than mutating one, because `[mutate]` is
-// a host effect and this package has none.
-//
-// HOW THE PACKAGE STAYS `core` WITH A STREAM IN ITS API
-//
-//     pub fn read_all<S: Read[e]>(src: S, p: YamlLimits) -> … [e]
-//
-// `S: Read[e]` binds the effect parameter of the standard library's
-// `Read` trait and the clause uses it (SPEC § 5.6), so the row means
-// "whatever the impl behind `S` supplies": `[io, fs]` for a file,
-// nothing at all for an in-memory buffer.  This package has not spent
-// an effect, it has said "whatever you hand me", and the impl that
-// supplies the cost is declared where the host is.  It is the same
-// machine as `feed` and `finish` with the pump written once, here,
-// instead of once per caller.
-//
-// HOW THIS DIFFERS FROM `std.yaml`
-//
-// `std.yaml` reads a FLAT subset — mappings and sequences of scalars,
-// no nesting, no flow style, no anchors, no multi-document streams —
-// and its whole error channel is `?T`, so a document that fails gives
-// `None` with no reason and no position.  Under `novo run` it can
-// shell out to `yq` for full fidelity, which means the answer depends
-// on whether a binary is installed; under LLVM it is the C subset
-// only.  It is not available at `@tier(embedded)`.
-//
-// This package is a native parser with positions, the safety policy
-// above, nesting, flow style, anchors, block scalars and streams — and
-// no subprocess anywhere, which is the difference that matters most:
-// a library whose behaviour depends on what is in `$PATH` cannot be
-// depended on.
+// `read_all<S: Read[e]>` is the same machine with the pump written
+// once.  `S: Read[e]` binds the effect parameter of the standard
+// library's `Read` trait (SPEC section 5.6), so it costs the caller
+// what the caller's stream costs, and this package spends nothing.
 
+use std.str
+use std.list
+use std.bytes
+use yamlnode
 use yamlsafe
 use yamlerror
+use yamlparse
 
 // A YAML reader between chunks.
 //
-// Opaque in practice — the fields are here so the state is reviewable
-// rather than because a caller should read them — and carried by
-// value: `feed` returns the next one and the previous is finished
-// with.  A reader that has failed stays failed; `error` is what says
-// so, and every subsequent `feed` yields nothing.
+// Carried by value: `feed` answers the next one.  A reader that has
+// failed stays failed; `error` says why, and every later `feed` yields
+// nothing.
 //
 // ```novo
 // use yamlread
@@ -77,43 +48,39 @@ use yamlerror
 pub struct YamlReader
     // The policy this reader was built with, unchanged.
     limits: YamlLimits
-    // The 1-based line the scanner is on.
+    // The 1-based stream line of the first byte not yet read as a
+    // complete line.
     line: Int
-    // The 1-based byte column within that line.
-    col: Int
-    // How many documents have been EMITTED so far in this stream.
+    // How many documents have been emitted so far in this stream.
     doc_index: Int
-    // The indentation columns of the collections currently open,
-    // outermost first.  Its length is the current depth, which is
-    // what `max_depth` is checked against.
-    indents: [Int]
-    // Bytes of the current line not yet consumed, carried across a
+    // The bytes of the current line not yet ended, carried across a
     // chunk boundary.
     partial: Str
-    // Anchors defined so far in the CURRENT document, as alternating
-    // name and serialised node.  Cleared at each `---`, because YAML
-    // 1.2 § 3.2.2.2 scopes an anchor to its document and an alias
-    // that reached backwards past a boundary would be reading another
-    // document's data.
+    // The trailing bytes of a UTF-8 sequence a chunk ended inside.
+    pending: [Int]
+    // Whether a document is open: a `---` has started one, or content
+    // has.
+    in_doc: Bool
+    // The lines of the open document so far.
+    doc_lines: [Str]
+    // The stream line of the open document's first line.
+    doc_line: Int
+    // Whether the open document began with a `---` line.
+    marked: Bool
+    // The directives read since the last document, `%YAML` and `%TAG`.
+    directives: [Str]
+    // The anchors the most recently completed document defined, in
+    // the order it defined them.  An anchor is scoped to its document
+    // (section 3.2.2.2), so the next document starts with none.
     anchors: [Str]
-    // Nodes produced so far in the current document, against
-    // `max_nodes`.
-    nodes: Int
-    // The sticky failure's tag, or `-1`.  `error` reads it back as a
-    // `YamlError` with the position it was recorded at.
-    failed: Int
-    // The line the sticky failure was recorded at, or `-1`.
-    failed_line: Int
-    // The column the sticky failure was recorded at, or `-1`.
-    failed_col: Int
+    // The sticky failure, or `None`.
+    failure: ?YamlError
 
 // A reader at the start of a stream.
 //
-// A policy with a contradiction in it — a negative budget, say — does
-// not fail here, because a constructor has no error channel; it
-// produces a reader that is already failed, so the first `feed` yields
-// nothing and `error` says why.  That is one failure path instead of
-// two.
+// A policy with a negative budget does not fail here: a constructor
+// has no error channel.  The first document that reaches the budget is
+// refused, and `error` says which.
 //
 // ```novo
 // use yamlread
@@ -126,10 +93,12 @@ pub struct YamlReader
 //         None    => println("ready")
 // ```
 pub fn reader(p: YamlLimits) -> YamlReader
-    todo("yaml-nv.yamlread.reader")
+    YamlReader { limits: p, line: 1, doc_index: 0, partial: "", pending: [], in_doc: false,
+                 doc_lines: [], doc_line: 1, marked: false, directives: [], anchors: [],
+                 failure: None }
 
 // Feed the next chunk; get back the reader to feed the chunk after it,
-// and every document those bytes COMPLETED.
+// and every document those bytes completed.
 //
 // A document is complete when a `---` or `...` terminator or the end
 // of the stream closes it.  A chunk that ends mid-document produces
@@ -155,7 +124,10 @@ pub fn reader(p: YamlLimits) -> YamlReader
 //     println("${list.len(docs)}")              // 1 — the second is unterminated
 // ```
 pub fn feed(r: YamlReader, chunk: Bytes) -> (YamlReader, [YamlValue])
-    todo("yaml-nv.yamlread.feed")
+    var m = machine(r)
+    feed_bytes(m, bytes.to_byte_list(chunk))
+    probe(m)
+    (reader_of(m), m.docs[:])
 
 // `feed` for a caller who has a `Str`.
 //
@@ -173,7 +145,10 @@ pub fn feed(r: YamlReader, chunk: Bytes) -> (YamlReader, [YamlValue])
 //     println("${list.len(docs)}")              // 1
 // ```
 pub fn feed_str(r: YamlReader, chunk: Str) -> (YamlReader, [YamlValue])
-    todo("yaml-nv.yamlread.feed_str")
+    var m = machine(r)
+    feed_text(m, chunk)
+    probe(m)
+    (reader_of(m), m.docs[:])
 
 // End of stream: the last document, if it was not terminated, and the
 // verdict.
@@ -181,7 +156,7 @@ pub fn feed_str(r: YamlReader, chunk: Str) -> (YamlReader, [YamlValue])
 // A YAML stream's final document need not carry a terminator, so a
 // stream ending `b: 2` has a document in it that no `feed` has
 // emitted — this is where it comes out.  A stream that ended with a
-// terminator has nothing left and this returns an empty list, NOT a
+// terminator has nothing left and this returns an empty list, not a
 // document containing null.
 //
 // `Err` when the reader is failed, including the failure a `feed`
@@ -200,7 +175,11 @@ pub fn feed_str(r: YamlReader, chunk: Str) -> (YamlReader, [YamlValue])
 //         Err(e)   => println(e.message())
 // ```
 pub fn finish(r: YamlReader) -> Result<[YamlValue], YamlError>
-    todo("yaml-nv.yamlread.finish")
+    var m = machine(r)
+    end_of_stream(m)
+    if let Some(e) = m.failure
+        return Err(e)
+    Ok(m.docs[:])
 
 // The sticky failure this reader is carrying, or `None`.
 //
@@ -221,13 +200,13 @@ pub fn finish(r: YamlReader) -> Result<[YamlValue], YamlError>
 //         None    => println("fine")
 // ```
 pub fn error(r: YamlReader) -> ?YamlError
-    todo("yaml-nv.yamlread.error")
+    r.failure
 
 // Parse a single-document string.
 //
 // The common case, and the one every caller reaching for this package
 // has: one file, one document, a tree or a reason.  A stream with a
-// SECOND document is `BadDirective` at the `---` rather than silently
+// second document is `BadDirective` at the `---` rather than silently
 // keeping the first — a caller that wrote `parse` and got a
 // multi-document file has a decision to make, and picking one for
 // them is how a deployment applies half a manifest.
@@ -243,7 +222,16 @@ pub fn error(r: YamlReader) -> ?YamlError
 //         Err(e)  => println(e.message())
 // ```
 pub fn parse(text: Str, p: YamlLimits) -> Result<YamlValue, YamlError>
-    todo("yaml-nv.yamlread.parse")
+    var m = machine(reader(p))
+    feed_text(m, text)
+    end_of_stream(m)
+    if let Some(e) = m.failure
+        return Err(e)
+    if list.len(m.docs) > 1
+        return Err(BadDirective(m.starts[1], 1, "---"))
+    if list.len(m.docs) == 0
+        return Ok(YamlNull)
+    Ok(m.docs[0])
 
 // Parse a multi-document stream, in order.
 //
@@ -261,7 +249,12 @@ pub fn parse(text: Str, p: YamlLimits) -> Result<YamlValue, YamlError>
 //         Err(e)   => println(e.message())
 // ```
 pub fn parse_stream(text: Str, p: YamlLimits) -> Result<[YamlValue], YamlError>
-    todo("yaml-nv.yamlread.parse_stream")
+    var m = machine(reader(p))
+    feed_text(m, text)
+    end_of_stream(m)
+    if let Some(e) = m.failure
+        return Err(e)
+    Ok(m.docs[:])
 
 // Parse the bytes of a stream.
 //
@@ -279,12 +272,17 @@ pub fn parse_stream(text: Str, p: YamlLimits) -> Result<[YamlValue], YamlError>
 //         Err(_) => println("not yaml")
 // ```
 pub fn parse_bytes(input: Bytes, p: YamlLimits) -> Result<[YamlValue], YamlError>
-    todo("yaml-nv.yamlread.parse_bytes")
+    var m = machine(reader(p))
+    feed_bytes(m, bytes.to_byte_list(input))
+    end_of_stream(m)
+    if let Some(e) = m.failure
+        return Err(e)
+    Ok(m.docs[:])
 
 // Read a whole stream and parse the documents it held, charged exactly
 // what the stream costs.
 //
-// THE LOAD-BEARING SIGNATURE OF THIS MODULE.  `S: Read[e]` binds the
+// `S: Read[e]` binds the
 // effect parameter of `Read` and the clause is `[e]`, so this package
 // is charged nothing and the caller is charged what its own impl
 // declared (SPEC § 5.6, and `docs/publishing.md` § Design).  A `File`
@@ -311,7 +309,19 @@ pub fn parse_bytes(input: Bytes, p: YamlLimits) -> Result<[YamlValue], YamlError
 //         Err(e)   => println(yamlerror.render(e, "deploy.yaml"))
 // ```
 pub fn read_all<S: Read[e]>(src: S, p: YamlLimits) -> Result<[YamlValue], YamlError> [e]
-    todo("yaml-nv.yamlread.read_all")
+    var m = machine(reader(p))
+    loop
+        match src.read(65536)
+            Err(e)    =>
+                return Err(Transport(e))
+            Ok(chunk) =>
+                if bytes.len(chunk) == 0
+                    break
+                feed_bytes(m, bytes.to_byte_list(chunk))
+    end_of_stream(m)
+    if let Some(e) = m.failure
+        return Err(e)
+    Ok(m.docs[:])
 
 // The first refusal a parse would produce, for a caller that wants to
 // check a stream without keeping the trees.
@@ -331,7 +341,9 @@ pub fn read_all<S: Read[e]>(src: S, p: YamlLimits) -> Result<[YamlValue], YamlEr
 //         None    => println("valid")
 // ```
 pub fn check(text: Str, p: YamlLimits) -> ?YamlError
-    todo("yaml-nv.yamlread.check")
+    match parse_stream(text, p)
+        Ok(_)  => None
+        Err(e) => Some(e)
 
 // The anchors a document defined, in the order they were defined.
 //
@@ -351,4 +363,289 @@ pub fn check(text: Str, p: YamlLimits) -> ?YamlError
 //     println("${list.len(yamlread.anchors_of(r2))}")
 // ```
 pub fn anchors_of(r: YamlReader) -> [Str]
-    todo("yaml-nv.yamlread.anchors_of")
+    r.anchors[:]
+
+// ── The machine ───────────────────────────────────────────────────────
+
+// A reader's state while a call works on it, and the documents the call
+// completed.
+struct Machine
+    limits: YamlLimits
+    var line: Int
+    var doc_index: Int
+    var partial: Str
+    var pending: [Int]
+    var in_doc: Bool
+    var doc_lines: [Str]
+    var doc_line: Int
+    var marked: Bool
+    var directives: [Str]
+    var anchors: [Str]
+    var failure: ?YamlError
+    var docs: [YamlValue]
+    // The stream line each completed document started on.
+    var starts: [Int]
+
+fn machine(r: YamlReader) -> Machine
+    Machine { limits: r.limits, line: r.line, doc_index: r.doc_index, partial: r.partial,
+              pending: r.pending[:], in_doc: r.in_doc, doc_lines: r.doc_lines[:],
+              doc_line: r.doc_line, marked: r.marked, directives: r.directives[:],
+              anchors: r.anchors[:], failure: r.failure, docs: [], starts: [] }
+
+fn reader_of(m: Machine) -> YamlReader
+    YamlReader { limits: m.limits, line: m.line, doc_index: m.doc_index, partial: m.partial,
+                 pending: m.pending[:], in_doc: m.in_doc, doc_lines: m.doc_lines[:],
+                 doc_line: m.doc_line, marked: m.marked, directives: m.directives[:],
+                 anchors: m.anchors[:], failure: m.failure }
+
+// Read bytes: the complete UTF-8 sequences now, and the tail of one the
+// chunk ended inside with the next chunk.
+// Read the open document so far, and keep a refusal that no later line
+// could undo.  An unclosed quote or bracket may still be closed by the
+// next chunk; every other refusal is about lines that are complete.
+fn probe(var m: Machine)
+    if not m.in_doc or m.failure != None
+        return
+    let text = str.join(m.doc_lines, "\n") + "\n"
+    var names: [Str] = []
+    match yamlparse.parse_doc(text, m.doc_line, handles(m), m.limits, m.marked, names)
+        Ok(_)  =>
+            pass
+        Err(e) =>
+            match e
+                UnterminatedQuote(_, _) =>
+                    pass
+                UnterminatedFlow(_, _)  =>
+                    pass
+                _                       =>
+                    m.failure = Some(e)
+
+fn feed_bytes(var m: Machine, chunk: [u8])
+    if m.failure != None
+        return
+    var all = list.concat(m.pending, chunk)
+    let n = list.len(all)
+    let keep = incomplete_tail(all)
+    let body = all[0:n - keep]
+    m.pending = all[n - keep:n]
+    let bad = utf8_fault(body)
+    if bad >= 0
+        m.failure = Some(byte_fault(m, body, bad))
+        return
+    feed_text(m, bytes.to_str(bytes.from_byte_list(body)))
+
+// How many bytes at the end of `bs` begin a UTF-8 sequence that is not
+// complete yet.
+fn incomplete_tail(bs: [u8]) -> Int
+    let n = list.len(bs)
+    for back in 1..4
+        if back > n
+            break
+        let b = bs[n - back]
+        if b < 0x80
+            return 0
+        if b >= 0xC0
+            let need = if b >= 0xF0
+                4
+            else if b >= 0xE0
+                3
+            else
+                2
+            return if need > back then back else 0
+    0
+
+// The index of the first byte of `bs` that is not valid UTF-8, or a zero
+// byte, or -1.
+fn utf8_fault(bs: [u8]) -> Int
+    let n = list.len(bs)
+    var i = 0
+    for _ in 0..n + 1
+        if i >= n
+            break
+        let b = bs[i]
+        if b == 0
+            return i
+        if b < 0x80
+            i = i + 1
+            continue
+        let need = sequence_length(b)
+        if need == 0 or i + need > n
+            return i
+        for k in 1..need
+            if bs[i + k] < 0x80 or bs[i + k] >= 0xC0
+                return i
+        i = i + need
+    -1
+
+// The length of the UTF-8 sequence a lead byte starts, or 0 for a byte
+// that starts none.
+fn sequence_length(b: Int) -> Int
+    if b >= 0xC2 and b < 0xE0
+        2
+    elif b >= 0xE0 and b < 0xF0
+        3
+    elif b >= 0xF0 and b < 0xF5
+        4
+    else
+        0
+
+// `UnexpectedByte` for the byte at `at` of `body`, positioned in the
+// stream.
+fn byte_fault(m: Machine, body: [u8], at: Int) -> YamlError
+    var line = m.line
+    var col = str.len(m.partial) + 1
+    for i in 0..at
+        if body[i] == '\n'
+            line = line + 1
+            col = 1
+        else
+            col = col + 1
+    UnexpectedByte(line, col, body[at])
+
+// Read text: every line it completes, and the rest kept for later.
+fn feed_text(var m: Machine, text: Str)
+    if m.failure != None
+        return
+    let data = m.partial + text
+    let n = str.len(data)
+    var start = 0
+    for i in 0..n
+        if str.byte_at_or(data, i, 0) == '\n'
+            var e = i
+            if e > start and str.byte_at_or(data, e - 1, 0) == '\r'
+                e = e - 1
+            take_line(m, str.slice(data, start, e))
+            start = i + 1
+            if m.failure != None
+                break
+    m.partial = str.slice(data, start, n)
+
+fn end_of_stream(var m: Machine)
+    if m.failure != None
+        return
+    if list.len(m.pending) > 0
+        m.failure = Some(byte_fault(m, m.pending, 0))
+        return
+    if m.partial != ""
+        let last = m.partial
+        m.partial = ""
+        take_line(m, last)
+    if m.in_doc and m.failure == None
+        emit(m)
+    elif not m.in_doc and m.failure == None and list.len(m.directives) > 0
+        // A directive belongs to the document after it, and there is
+        // none (section 9.2).
+        m.failure = Some(BadDirective(m.line - 1, 1, m.directives[0]))
+
+// Whether `line` is the document marker `mark` (section 9.1.4): at the
+// start of the line and followed by whitespace or nothing.
+fn marker(line: Str, mark: Str) -> Bool
+    let after = str.byte_at_or(line, 3, 32)
+    str.starts_with(line, mark) and (after == ' ' or after == '\t')
+
+fn blank_or_comment(line: Str) -> Bool
+    let t = str.trim(line)
+    t == "" or str.starts_with(t, "#")
+
+// One complete line of the stream.
+fn take_line(var m: Machine, line: Str)
+    if marker(line, "---")
+        if m.in_doc
+            emit(m)
+        if m.failure == None
+            m.in_doc = true
+            m.marked = true
+            m.doc_line = m.line
+            m.doc_lines = ["   " + str.slice(line, 3, str.len(line))]
+    elif marker(line, "...")
+        if m.in_doc
+            emit(m)
+        elif list.len(m.directives) > 0
+            m.failure = Some(BadDirective(m.line, 1, m.directives[0]))
+        let rest = str.slice(line, 3, str.len(line))
+        if m.failure == None and not blank_or_comment(rest)
+            let t = str.trim_start(rest)
+            m.failure = Some(UnexpectedByte(m.line, str.len(line) - str.len(t) + 1,
+                                            str.byte_at_or(t, 0, 0)))
+        m.directives = []
+    elif m.in_doc
+        list.push(m.doc_lines, line)
+    elif str.starts_with(line, "%")
+        directive(m, line)
+    elif not blank_or_comment(line)
+        if list.len(m.directives) > 0
+            m.failure = Some(BadDirective(m.line, 1, m.directives[0]))
+        else
+            m.in_doc = true
+            m.marked = false
+            m.doc_line = m.line
+            m.doc_lines = [line]
+    m.line = m.line + 1
+
+// A `%YAML` or `%TAG` directive (section 6.8), kept for the next
+// document.  A `%YAML` for a version other than 1.x, a second one, and
+// a malformed `%TAG` are refused; any other directive is reserved and
+// ignored, as section 6.8.1 says.
+fn directive(var m: Machine, line: Str)
+    let words = str.words(line)
+    let name = words[0]
+    var ok = true
+    let count = significant_words(words)
+    if name == "%YAML"
+        ok = count == 2 and version_ok(words[1]) and not has_yaml_directive(m)
+    elif name == "%TAG"
+        ok = count == 3 and str.starts_with(words[1], "!") and str.ends_with(words[1], "!")
+    if not ok
+        m.failure = Some(BadDirective(m.line, 1, line))
+        return
+    list.push(m.directives, line)
+
+// How many words a directive has before a comment.
+fn significant_words(words: [Str]) -> Int
+    var n = 0
+    for w in words
+        if str.starts_with(w, "#")
+            break
+        n = n + 1
+    n
+
+// A `%YAML` version this reader reads: 1, a period, and digits.
+fn version_ok(v: Str) -> Bool
+    if not str.starts_with(v, "1.") or str.len(v) < 3
+        return false
+    for i in 2..str.len(v)
+        let b = str.byte_at_or(v, i, 0)
+        if b < '0' or b > '9'
+            return false
+    true
+
+fn has_yaml_directive(m: Machine) -> Bool
+    for d in m.directives
+        if str.starts_with(d, "%YAML")
+            return true
+    false
+
+// The `%TAG` handles the pending directives declare.
+fn handles(m: Machine) -> HashMap<Str, Str>
+    var out: HashMap<Str, Str> = HashMap.new()
+    for d in m.directives
+        let words = str.words(d)
+        if words[0] == "%TAG"
+            out.set(words[1], words[2])
+    out
+
+// Parse the open document and add it to the completed ones.
+fn emit(var m: Machine)
+    let text = str.join(m.doc_lines, "\n") + "\n"
+    var names: [Str] = []
+    match yamlparse.parse_doc(text, m.doc_line, handles(m), m.limits, m.marked, names)
+        Ok(v)  =>
+            list.push(m.docs, v)
+            list.push(m.starts, m.doc_line)
+            m.anchors = names
+            m.doc_index = m.doc_index + 1
+        Err(e) =>
+            m.failure = Some(e)
+    m.in_doc = false
+    m.doc_lines = []
+    m.directives = []

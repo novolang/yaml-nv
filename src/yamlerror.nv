@@ -1,33 +1,19 @@
 // yamlerror.nv — every way a YAML stream can refuse to be read, and
 // where.
 //
-// WHY THE POSITION IS IN THE VARIANT AND NOT BESIDE IT
-//
 // YAML is whitespace-significant, so the mistakes people make in it are
-// mistakes of COLUMN: a key indented one space too far, a list item
-// under the wrong parent, a block scalar whose body is less indented
-// than its header.  A parser that said "mapping values are not allowed
-// here" without saying where — which is the message every YAML user has
-// seen and none has been helped by — leaves a person scanning a
-// two-hundred-line file for a space.  So every reason that has a
-// position carries the line AND the column, and the ones that do not
-// are honest about it: `line_of` answers `-1` rather than `0`.
+// mistakes of column: a key indented one space too far, an item under
+// the wrong parent.  Every reason with a position carries the line and
+// the column, and `line_of` answers -1 for the reasons that have none.
+// Lines and columns are 1-based, and the column counts bytes, which can
+// always be produced even for a file whose encoding went wrong.
 //
-// Lines and columns are 1-based, and the column is a BYTE offset into
-// the line.  Byte and not character: YAML is UTF-8 and this parser
-// checks it, but the file a person needs a position for is often the
-// file whose encoding went wrong, and a byte offset can always be
-// produced.
-//
-// THE SAFETY REFUSALS ARE ERRORS, NOT SILENCES
-//
-// `UnsafeTag` and the three budget arms are what make this a SAFE
-// loader, and they are loud on purpose.  A loader that quietly ignored
-// `!!python/object/apply` would leave a caller believing its input was
-// checked; a loader that quietly truncated an alias expansion would
-// hand back a document that is not the one in the file.  Both are
-// refusals with a position, and the caller decides what to do about
-// them.
+// The safety refusals, `UnsafeTag` and the three budgets, are errors
+// rather than silences: a loader that quietly ignored a tag or
+// truncated an expansion would hand back a document that is not the one
+// in the file.
+
+use std.str
 
 // Why a YAML stream, or a request about a parsed document, could not be
 // answered.
@@ -61,7 +47,7 @@ pub enum YamlError
     // A `-` sequence entry where a sequence cannot start.
     UnexpectedSequenceEntry(line: Int, col: Int, context: Str)
     // A flow collection — `[…]` or `{…}` — that was never closed.  The
-    // position is the OPENING bracket, which is the byte a person has
+    // position is the opening bracket, which is the byte a person has
     // to go and fix.
     UnterminatedFlow(line: Int, col: Int)
     // A `]` or `}` that closes nothing, or closes the wrong kind.
@@ -89,7 +75,7 @@ pub enum YamlError
     // do not cross document boundaries, so this covers both a typo
     // and an alias reaching backwards past a `---`.
     UnknownAnchor(line: Int, col: Int, name: Str)
-    // A tag this loader refuses to honour.  THE SAFETY REFUSAL: a
+    // A tag this loader refuses to honour.  This is the safety refusal: a
     // safe loader resolves the core schema's tags and nothing else,
     // and every language-specific tag — `!!python/object/apply`,
     // `!ruby/object`, `!!java`, and every `!` tag a caller has not
@@ -99,14 +85,15 @@ pub enum YamlError
     // A tag handle that is syntactically wrong, or a `%TAG` directive
     // whose prefix it needs was never declared.
     BadTag(line: Int, col: Int, tag: Str)
-    // A `%` directive this loader does not implement, or a `%YAML`
-    // naming a version it will not read.  `directive` is the line.
+    // A `%YAML` directive for a version other than 1.x, a second
+    // `%YAML` for one document, a malformed `%TAG`, or a directive with
+    // no document after it (section 6.8).  `directive` is the line.
     BadDirective(line: Int, col: Int, directive: Str)
     // The document nested collections deeper than the limits allowed.
     // A bound rather than a stack overflow.
     TooDeep(line: Int, col: Int, limit: Int)
     // Expanding the aliases in this document would produce more nodes
-    // than the limits allowed.  THE BILLION-LAUGHS REFUSAL: a
+    // than the limits allowed.  This is the refusal of the "billion laughs": a
     // twenty-line document whose aliases expand to a terabyte is the
     // classic YAML denial of service, and it is stopped by counting
     // rather than by a heuristic.  `limit` is the budget, so the
@@ -131,29 +118,71 @@ pub enum YamlError
     // node is where the document put it and the mistake is in the
     // expectation.
     WrongKind(path: Str, want: Str, got: Str)
-    // A writer was handed a document it cannot emit — a mapping key
-    // that is itself a collection under a policy that forbids one, a
-    // string with a byte no YAML scalar may hold.  `why` is prose.
+    // A writer was handed a document it cannot emit: a mapping key
+    // that is itself a collection.  `why` is prose.
     NotEmittable(why: Str)
+    // A mapping key that is itself a sequence or a mapping, under a
+    // policy that refuses one.  `yamlsafe.with_complex_keys` allows
+    // it.
+    ComplexKey(line: Int, col: Int)
     // The stream underneath `yamlread.read_all` failed.  The host's
     // error, carried through unmodified: this package does not know
     // what a socket timing out means to the program that opened it.
     Transport(cause: IoError)
 
-// `YamlError` is an `Error`, which is what lets `Result<T, YamlError>`
-// exist at all (SPEC § 3.4).
+// The one-line message, for a caller printing rather than matching.
+// It names the rule and not the parser's state, and it leaves the
+// position out, so a caller renders `file:line:col: message` in the
+// shape its own diagnostics have.
 impl Error for YamlError
-    // The one-line message, for a caller printing rather than
-    // matching.
-    //
-    // The sentence names the rule and not the parser's state, and it
-    // does NOT include the position — `line_of` and `col_of` are
-    // separate so a caller can render `file:line:col: message` in
-    // whatever shape its own diagnostics have.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("yaml-nv.YamlError.message")
+        match self
+            BadIndent(_, c, want)              =>
+                "a line indented to column ${c} where the open block is at column ${want}"
+            TabInIndent(_, _)                  =>
+                "a tab where YAML requires a space"
+            UnexpectedMappingValue(_, _, ctx)  =>
+                "a mapping value where " + ctx + " cannot hold one"
+            UnexpectedSequenceEntry(_, _, ctx) =>
+                "a sequence entry where " + ctx + " cannot hold one"
+            UnterminatedFlow(_, _)             =>
+                "a flow collection that is never closed"
+            UnexpectedFlowClose(_, _)          =>
+                "a closing bracket that closes nothing"
+            UnterminatedQuote(_, _)            =>
+                "a quoted scalar that is never closed"
+            BadEscape(_, _, q)                 =>
+                "the escape " + q + " is not one YAML defines"
+            BadBlockScalar(_, _, why)          =>
+                "a block scalar " + why
+            DuplicateKey(_, _, k, first)       =>
+                "the key " + k + " is already bound on line ${first}"
+            UnknownAnchor(_, _, name)          =>
+                "no anchor &" + name + " is defined before this point in the document"
+            UnsafeTag(_, _, tag)               =>
+                "the tag " + tag + " is not one this loader honours"
+            BadTag(_, _, tag)                  =>
+                "the tag " + tag + " is malformed or names an undeclared handle"
+            BadDirective(_, _, d)              =>
+                "the directive " + d + " is not one this loader reads"
+            TooDeep(_, _, limit)               =>
+                "collections nest deeper than ${limit} levels"
+            AliasBudgetExceeded(_, _, limit)   =>
+                "expanding the aliases makes more than ${limit} nodes"
+            AliasRepeatExceeded(_, _, n, l)    =>
+                "the anchor &" + n + " is expanded more than ${l} times"
+            UnexpectedByte(_, _, b)            =>
+                "the byte 0x" + hex2(b) + " cannot appear here"
+            NoSuchKey(path)                    =>
+                "no value at " + path
+            WrongKind(path, want, got)         =>
+                "the value at " + path + " is " + got + ", not " + want
+            NotEmittable(why)                  =>
+                "the tree cannot be written: " + why
+            ComplexKey(_, _)                   =>
+                "a mapping key that is a collection"
+            Transport(cause)                   =>
+                "the stream failed: " + cause.message()
 
 // The 1-based line, or `-1` for the reasons that have no position.
 //
@@ -164,7 +193,7 @@ impl Error for YamlError
 //     println("${yamlerror.line_of(NoSuchKey("db.host"))}")   // -1
 // ```
 pub fn line_of(e: YamlError) -> Int
-    todo("yaml-nv.yamlerror.line_of")
+    position(e).0
 
 // The 1-based byte column within that line, or `-1`.
 //
@@ -175,7 +204,7 @@ pub fn line_of(e: YamlError) -> Int
 //     println("${yamlerror.col_of(TabInIndent(4, 3))}")       // 3
 // ```
 pub fn col_of(e: YamlError) -> Int
-    todo("yaml-nv.yamlerror.col_of")
+    position(e).1
 
 // `file:line:col: message`, the form an editor's error list parses.
 //
@@ -190,9 +219,12 @@ pub fn col_of(e: YamlError) -> Int
 //     println(yamlerror.render(TabInIndent(4, 3), "deploy.yaml"))
 // ```
 pub fn render(e: YamlError, path: Str) -> Str
-    todo("yaml-nv.yamlerror.render")
+    let l = line_of(e)
+    if l < 0
+        return path + ": " + e.message()
+    path + ":${l}:${col_of(e)}: " + e.message()
 
-// Whether this refusal is a SAFETY refusal rather than a syntax one.
+// Whether this refusal is a safety refusal rather than a syntax one.
 //
 // True for `UnsafeTag` and the three budget arms; false for
 // everything else.  The distinction matters to a caller because the
@@ -210,4 +242,37 @@ pub fn render(e: YamlError, path: Str) -> Str
 //     println("${yamlerror.is_safety_refusal(TabInIndent(4, 3))}")   // false
 // ```
 pub fn is_safety_refusal(e: YamlError) -> Bool
-    todo("yaml-nv.yamlerror.is_safety_refusal")
+    match e
+        UnsafeTag(_, _, _)              => true
+        AliasBudgetExceeded(_, _, _)    => true
+        AliasRepeatExceeded(_, _, _, _) => true
+        TooDeep(_, _, _)                => true
+        _                               => false
+
+// The line and the column of a refusal, or -1 and -1.
+fn position(e: YamlError) -> (Int, Int)
+    match e
+        BadIndent(l, c, _)               => (l, c)
+        TabInIndent(l, c)                => (l, c)
+        UnexpectedMappingValue(l, c, _)  => (l, c)
+        UnexpectedSequenceEntry(l, c, _) => (l, c)
+        UnterminatedFlow(l, c)           => (l, c)
+        UnexpectedFlowClose(l, c)        => (l, c)
+        UnterminatedQuote(l, c)          => (l, c)
+        BadEscape(l, c, _)               => (l, c)
+        BadBlockScalar(l, c, _)          => (l, c)
+        DuplicateKey(l, c, _, _)         => (l, c)
+        UnknownAnchor(l, c, _)           => (l, c)
+        UnsafeTag(l, c, _)               => (l, c)
+        BadTag(l, c, _)                  => (l, c)
+        BadDirective(l, c, _)            => (l, c)
+        TooDeep(l, c, _)                 => (l, c)
+        AliasBudgetExceeded(l, c, _)     => (l, c)
+        AliasRepeatExceeded(l, c, _, _)  => (l, c)
+        UnexpectedByte(l, c, _)          => (l, c)
+        ComplexKey(l, c)                 => (l, c)
+        _                                => (-1, -1)
+
+fn hex2(b: Int) -> Str
+    let digits = "0123456789ABCDEF"
+    str.slice(digits, b / 16 % 16, b / 16 % 16 + 1) + str.slice(digits, b % 16, b % 16 + 1)

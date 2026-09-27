@@ -1,51 +1,31 @@
 // yamlwrite.nv — block style out, under a named line-width policy.
 //
-// A LIBRARY DOES NOT PRINT
+// Every function here answers a `Str` or `Bytes`; nothing is written
+// anywhere.
 //
-// Every function here returns a `Str` or `Bytes`.  Nothing opens a
-// file and nothing writes to a console: `docs/publishing.md` § Design
-// is explicit that a library returns the text or takes the writer, and
-// this package has no effects with which to do otherwise even if it
-// wanted to.
+// The writer emits block style, because block style is what a person
+// reads down a page and edits in place.  A short sequence of scalars is
+// written in flow style, `[a, b]`, when it fits in `flow_threshold`
+// columns.  A mapping is always written in block style.
 //
-// BLOCK STYLE, BECAUSE THAT IS WHAT YAML IS FOR
+// The line-width policy is a named value, because a long plain scalar
+// cannot always be folded: folding it changes the value unless it is
+// folded at a single space, and a URL has none.  `WidthUnlimited` never
+// folds, `WidthFold` folds at a space and leaves a line long when there
+// is none, and `WidthQuoteFold` writes such a scalar double-quoted so
+// it can be broken with escaped line breaks.
 //
-// A tree can be emitted as flow — `{a: 1, b: [2, 3]}` — and that is
-// valid YAML and also JSON, and if a caller wanted that they would use
-// a JSON writer.  People choose YAML because block style is the one
-// serialisation format a person can read down a page and edit in
-// place.  So the writer emits block style, and flow is available
-// per-node for the collections where it genuinely reads better: a
-// short list of scalars on one line.  `flow_threshold` is where that
-// line is drawn, and it is a COLUMN budget rather than an item count,
-// because what makes a list unreadable is its width.
-//
-// THE LINE-WIDTH POLICY IS A NAMED VALUE, NOT AN INTEGER
-//
-// `width` on its own would be ambiguous in a way that matters: does 80
-// mean "wrap at 80" or "never exceed 80"?  For YAML those are
-// different, because a long plain scalar CANNOT always be wrapped —
-// folding it changes the value unless it is folded at a space, and a
-// URL has no spaces.  So the policy is three named cases that say what
-// happens when a line will not fit, and a caller picks the behaviour
-// rather than a number whose meaning it has to guess:
-//
-//   `WidthUnlimited`     — never fold.  Round-trips exactly; a long
-//                          value is a long line.
-//   `WidthFold(n)`       — fold at a space before column n, and leave
-//                          the line long when there is no space.  The
-//                          readable default.
-//   `WidthQuoteFold(n)`  — as `WidthFold`, and where folding is not
-//                          possible switch the scalar to double-quoted
-//                          so it CAN be broken with escapes.  Honours
-//                          the width always, at the cost of quotes
-//                          nobody wrote.
-//
-// Three cases and not a flag because the third one changes the
-// spelling of a value to meet a formatting rule, and a caller should
-// have said yes to that.
+// A string that would read back as something else is quoted, and so is
+// one that starts with an indicator or holds `: ` or ` #`.  A string of
+// several lines is written as a literal block scalar when it can be,
+// and double-quoted otherwise.  What the writer writes, the reader
+// reads back to an equal tree.
 
-use yamlsafe
+use std.str
+use std.list
+use std.bytes
+use yamlnode
+use yamlerror
 
 // What the writer does when a line will not fit.
 //
@@ -122,7 +102,8 @@ pub struct YamlStyle
 //     println("${s.flow_threshold}")            // 60
 // ```
 pub fn standard() -> YamlStyle
-    todo("yaml-nv.yamlwrite.standard")
+    YamlStyle { indent: 2, width: WidthFold(80), flow_threshold: 60, indent_sequences: false,
+                explicit_start: false, explicit_end: false }
 
 // The style for output that must round-trip exactly: never fold,
 // never flow, explicit start and end markers.
@@ -137,7 +118,8 @@ pub fn standard() -> YamlStyle
 //     println("${yamlwrite.exact().flow_threshold}")   // 0
 // ```
 pub fn exact() -> YamlStyle
-    todo("yaml-nv.yamlwrite.exact")
+    YamlStyle { indent: 2, width: WidthUnlimited, flow_threshold: 0, indent_sequences: false,
+                explicit_start: true, explicit_end: true }
 
 // A style with the width policy replaced.
 //
@@ -151,7 +133,9 @@ pub fn exact() -> YamlStyle
 //         _              => println("folds")
 // ```
 pub fn with_width(s: YamlStyle, w: YamlWidth) -> YamlStyle
-    todo("yaml-nv.yamlwrite.with_width")
+    YamlStyle { indent: s.indent, width: w, flow_threshold: s.flow_threshold,
+                indent_sequences: s.indent_sequences, explicit_start: s.explicit_start,
+                explicit_end: s.explicit_end }
 
 // A style with the indent replaced.
 //
@@ -162,7 +146,9 @@ pub fn with_width(s: YamlStyle, w: YamlWidth) -> YamlStyle
 //     println("${yamlwrite.with_indent(yamlwrite.standard(), 4).indent}")   // 4
 // ```
 pub fn with_indent(s: YamlStyle, n: Int) -> YamlStyle
-    todo("yaml-nv.yamlwrite.with_indent")
+    YamlStyle { indent: n, width: s.width, flow_threshold: s.flow_threshold,
+                indent_sequences: s.indent_sequences, explicit_start: s.explicit_start,
+                explicit_end: s.explicit_end }
 
 // Render one document.
 //
@@ -170,8 +156,7 @@ pub fn with_indent(s: YamlStyle, n: Int) -> YamlStyle
 // looked like, because a text file that does not is a text file every
 // tool complains about.
 //
-// `NotEmittable` when the tree holds something no YAML scalar can
-// carry, or a collection key under a style that forbids one.
+// `NotEmittable` when a mapping key is a collection.
 //
 // ```novo
 // use yamlwrite
@@ -183,14 +168,14 @@ pub fn with_indent(s: YamlStyle, n: Int) -> YamlStyle
 //     print(yamlwrite.to_string(doc, yamlwrite.standard())!)   // port: 8080
 // ```
 pub fn to_string(v: YamlValue, style: YamlStyle) -> Result<Str, YamlError>
-    todo("yaml-nv.yamlwrite.to_string")
+    stream_to_string([v], style)
 
 // Render a multi-document stream, `---` between the documents.
 //
 // The separator is emitted between documents whatever `explicit_start`
 // says, because without it the output is not a stream and a reader
 // would see one document.  `explicit_start` decides only whether one
-// appears BEFORE the first.
+// appears before the first.
 //
 // ```novo
 // use yamlwrite
@@ -202,7 +187,16 @@ pub fn to_string(v: YamlValue, style: YamlStyle) -> Result<Str, YamlError>
 //     println("${str.contains(s, "---")}")      // true
 // ```
 pub fn stream_to_string(docs: [YamlValue], style: YamlStyle) -> Result<Str, YamlError>
-    todo("yaml-nv.yamlwrite.stream_to_string")
+    var parts: [Str] = []
+    for i in 0..list.len(docs)
+        if let Some(e) = check(docs[i])
+            return Err(e)
+        if i > 0 or style.explicit_start
+            list.push(parts, "---\n")
+        document(docs[i], style, parts)
+    if style.explicit_end
+        list.push(parts, "...\n")
+    Ok(str.join(parts, ""))
 
 // Render one document as bytes, UTF-8.
 //
@@ -218,9 +212,9 @@ pub fn stream_to_string(docs: [YamlValue], style: YamlStyle) -> Result<Str, Yaml
 //     println("${bytes.len(b)}")
 // ```
 pub fn to_bytes(v: YamlValue, style: YamlStyle) -> Result<Bytes, YamlError>
-    todo("yaml-nv.yamlwrite.to_bytes")
+    Ok(bytes.from_str(to_string(v, style)!))
 
-// Render ONE scalar as it would appear in a document, quoted if it has
+// Render one scalar as it would appear in a document, quoted if it has
 // to be.
 //
 // A string that would otherwise resolve to something else comes back
@@ -239,7 +233,16 @@ pub fn to_bytes(v: YamlValue, style: YamlStyle) -> Result<Bytes, YamlError>
 //     println(yamlwrite.scalar_to_string(YamlBool(true)))    // true
 // ```
 pub fn scalar_to_string(v: YamlValue) -> Str
-    todo("yaml-nv.yamlwrite.scalar_to_string")
+    match v
+        YamlStr(t)   => if needs_quote(t)
+            double_quoted(t)
+        else
+            t
+        YamlInt(i)   => "${i}"
+        YamlFloat(f) => float_text(f)
+        YamlBool(b)  => str.from_bool(b)
+        YamlNull     => "null"
+        _            => flow_text(v)
 
 // Whether a string would need quoting to be written as a plain scalar.
 //
@@ -257,7 +260,26 @@ pub fn scalar_to_string(v: YamlValue) -> Str
 //     println("${yamlwrite.needs_quote("hello")}")  // false
 // ```
 pub fn needs_quote(text: Str) -> Bool
-    todo("yaml-nv.yamlwrite.needs_quote")
+    if text == "" or text != str.trim(text)
+        return true
+    if yamlnode.kind_of(yamlnode.resolve(text, SchemaCore)) != KindStr
+        return true
+    let first = str.byte_at_or(text, 0, 0)
+    let second = str.byte_at_or(text, 1, 32)
+    if str.contains("#&*!|>'\"%@`,[]{}", str.from_byte(first))
+        return true
+    if (first == '-' or first == '?' or first == ':') and (second == ' ' or second == '\t'
+            or str.len(text) == 1)
+        return true
+    if str.starts_with(text, "---") or str.starts_with(text, "...")
+        return true
+    if str.contains(text, ": ") or str.contains(text, " #") or str.ends_with(text, ":")
+        return true
+    for i in 0..str.len(text)
+        let b = str.byte_at_or(text, i, 0)
+        if b < 32 or b == 127
+            return true
+    false
 
 // Whether a tree can be written as a YAML document, and why not.
 //
@@ -266,7 +288,7 @@ pub fn needs_quote(text: Str) -> Bool
 // `yamlread.parse` always passes, which is what makes the round trip
 // total.
 //
-// It does NOT check the safety budgets — that is `yamlsafe.check`, and
+// It does not check the safety budgets — that is `yamlsafe.check`, and
 // they are separate because "can this be written" and "would a reader
 // with this policy accept it" are different questions with different
 // answers, and a caller emitting for a stricter reader asks both.
@@ -281,4 +303,327 @@ pub fn needs_quote(text: Str) -> Bool
 //         None    => println("writable")       // a scalar IS a document
 // ```
 pub fn check(v: YamlValue) -> ?YamlError
-    todo("yaml-nv.yamlwrite.check")
+    match v
+        YamlMap(pairs) =>
+            for pair in pairs
+                let k = yamlnode.kind_of(pair.key)
+                if k == KindMap or k == KindSeq
+                    return Some(NotEmittable("a mapping key that is a collection"))
+                if let Some(e) = check(pair.value)
+                    return Some(e)
+            None
+        YamlSeq(items) =>
+            for x in items
+                if let Some(e) = check(x)
+                    return Some(e)
+            None
+        _              =>
+            None
+
+// ── Spelling ──────────────────────────────────────────────────────────
+
+fn float_text(f: Float) -> Str
+    if f != f
+        return ".nan"
+    if f == 1.0 / 0.0
+        return ".inf"
+    if f == -1.0 / 0.0
+        return "-.inf"
+    let t = str.from_float_shortest(f)
+    if str.contains(t, ".") or str.contains(t, "e") or str.contains(t, "E")
+        t
+    else
+        t + ".0"
+
+// A string double-quoted, with `\`, `"` and the control characters
+// escaped (section 5.7).
+fn double_quoted(t: Str) -> Str
+    var parts: [Str] = ["\""]
+    var run = 0
+    let n = str.len(t)
+    for i in 0..n
+        let b = str.byte_at_or(t, i, 0)
+        let esc = escape_for(b)
+        if esc != ""
+            list.push(parts, str.slice(t, run, i))
+            list.push(parts, esc)
+            run = i + 1
+    list.push(parts, str.slice(t, run, n))
+    list.push(parts, "\"")
+    str.join(parts, "")
+
+fn escape_for(b: Int) -> Str
+    if b == '"'
+        "\\\""
+    elif b == '\\'
+        "\\\\"
+    elif b == '\n'
+        "\\n"
+    elif b == '\t'
+        "\\t"
+    elif b == '\r'
+        "\\r"
+    elif b < 32 or b == 127
+        "\\x" + hex2(b)
+    else
+        ""
+
+fn hex2(b: Int) -> Str
+    let digits = "0123456789ABCDEF"
+    str.slice(digits, b / 16, b / 16 + 1) + str.slice(digits, b % 16, b % 16 + 1)
+
+// A scalar inside a flow collection, where `,`, brackets and braces
+// would end it.
+fn flow_scalar(v: YamlValue) -> Str
+    if let YamlStr(t) = v
+        var special = false
+        for c in [",", "[", "]", "{", "}"]
+            if str.contains(t, c)
+                special = true
+        if special
+            return double_quoted(t)
+    scalar_to_string(v)
+
+// A collection in flow style.
+fn flow_text(v: YamlValue) -> Str
+    var parts: [Str] = []
+    match v
+        YamlMap(pairs) =>
+            for pair in pairs
+                list.push(parts, flow_value(pair.key) + ": " + flow_value(pair.value))
+            "{" + str.join(parts, ", ") + "}"
+        _              =>
+            for x in yamlnode.items_of(v)
+                list.push(parts, flow_value(x))
+            "[" + str.join(parts, ", ") + "]"
+
+fn flow_value(v: YamlValue) -> Str
+    match v
+        YamlSeq(_) => flow_text(v)
+        YamlMap(_) => flow_text(v)
+        _          => flow_scalar(v)
+
+fn is_collection(v: YamlValue) -> Bool
+    let k = yamlnode.kind_of(v)
+    k == KindMap or k == KindSeq
+
+// A sequence of scalars short enough to write on one line.
+fn flow_fits(v: YamlValue, style: YamlStyle, used: Int) -> Bool
+    if style.flow_threshold <= 0
+        return false
+    for x in yamlnode.items_of(v)
+        if is_collection(x) or multiline(x)
+            return false
+    used + str.len(flow_text(v)) <= style.flow_threshold
+
+fn multiline(v: YamlValue) -> Bool
+    match v
+        YamlStr(t) => str.contains(t, "\n")
+        _          => false
+
+// ── Block style ───────────────────────────────────────────────────────
+
+fn document(v: YamlValue, style: YamlStyle, var parts: [Str])
+    match v
+        YamlMap(pairs) =>
+            if list.len(pairs) == 0
+                list.push(parts, "{}\n")
+            else
+                block_map(pairs, 0, style, parts)
+        YamlSeq(items) =>
+            if list.len(items) == 0
+                list.push(parts, "[]\n")
+            else
+                block_seq(items, 0, style, parts)
+        _              =>
+            list.push(parts, "")
+            after_indicator(v, 0, 0, style, parts)
+
+fn spaces(n: Int) -> Str
+    str.repeat(" ", n)
+
+fn key_text(k: YamlValue) -> Str
+    if multiline(k)
+        if let YamlStr(t) = k
+            return double_quoted(t)
+    flow_scalar(k)
+
+fn block_map(pairs: [YamlPair], indent: Int, style: YamlStyle, var parts: [Str])
+    for pair in pairs
+        let head = spaces(indent) + key_text(pair.key) + ":"
+        list.push(parts, head)
+        value_after(pair.value, indent, str.len(head), style, parts, true)
+
+fn block_seq(items: [YamlValue], indent: Int, style: YamlStyle, var parts: [Str])
+    for x in items
+        list.push(parts, spaces(indent) + "-")
+        value_after(x, indent, indent + 1, style, parts, false)
+
+// The node after a `key:` or a `-` at `indent`, the line so far `used`
+// columns long.
+fn value_after(v: YamlValue, indent: Int, used: Int, style: YamlStyle, var parts: [Str],
+               in_map: Bool)
+    let inner = indent + style.indent
+    match v
+        YamlMap(pairs) =>
+            if list.len(pairs) == 0
+                list.push(parts, " {}\n")
+            elif in_map
+                list.push(parts, "\n")
+                block_map(pairs, inner, style, parts)
+            else
+                var nested: [Str] = []
+                block_map(pairs, indent + 2, style, nested)
+                list.push(parts, " " + str.slice(nested[0], indent + 2, str.len(nested[0])))
+                list.append(parts, nested[1:list.len(nested)])
+        YamlSeq(items) =>
+            if list.len(items) == 0
+                list.push(parts, " []\n")
+            elif flow_fits(v, style, used + 1)
+                list.push(parts, " " + flow_text(v) + "\n")
+            elif in_map
+                list.push(parts, "\n")
+                block_seq(items, (if style.indent_sequences then inner else indent), style, parts)
+            else
+                var nested: [Str] = []
+                block_seq(items, indent + 2, style, nested)
+                list.push(parts, " " + str.slice(nested[0], indent + 2, str.len(nested[0])))
+                list.append(parts, nested[1:list.len(nested)])
+        _              =>
+            list.push(parts, " ")
+            after_indicator(v, inner, used + 1, style, parts)
+
+// A scalar at the end of a line, `used` columns in, whose continuation
+// lines are indented to `inner`.
+fn after_indicator(v: YamlValue, inner: Int, used: Int, style: YamlStyle, var parts: [Str])
+    if let YamlStr(t) = v
+        if str.contains(t, "\n")
+            if literal_ok(t)
+                list.append(parts, literal(t, inner))
+                return
+            list.push(parts, double_quoted(t) + "\n")
+            return
+        if not needs_quote(t)
+            list.push(parts, folded_plain(t, inner, used, style) + "\n")
+            return
+        list.push(parts, quoted_fold(t, inner, used, style) + "\n")
+        return
+    list.push(parts, scalar_to_string(v) + "\n")
+
+// Whether a string of several lines can be a literal block scalar: its
+// first line with text does not start with whitespace, and it holds no
+// control character a block scalar cannot carry.
+fn literal_ok(t: Str) -> Bool
+    // The first line with text decides the indentation a reader finds,
+    // so it may not start with whitespace, and the empty lines before
+    // it must be empty.
+    var found = false
+    for line in str.split(t, "\n")
+        if line == ""
+            continue
+        if str.starts_with(line, " ") or str.starts_with(line, "\t")
+            return false
+        found = true
+        break
+    if not found
+        return false
+    for i in 0..str.len(t)
+        let b = str.byte_at_or(t, i, 0)
+        if b < 32 and b != '\n' and b != '\t' or b == 127
+            return false
+    true
+
+// A literal block scalar: the header with its chomping indicator, then
+// the lines indented to `inner`.
+fn literal(t: Str, inner: Int) -> [Str]
+    var trailing = 0
+    let n = str.len(t)
+    for k in 0..n
+        if str.byte_at_or(t, n - 1 - k, 0) != '\n'
+            break
+        trailing = trailing + 1
+    let body = str.slice(t, 0, n - trailing)
+    let chomp = if trailing == 0
+        "-"
+    else if trailing == 1
+        ""
+    else
+        "+"
+    var out: [Str] = ["|" + chomp + "\n"]
+    for line in str.split(body, "\n")
+        if line == ""
+            list.push(out, "\n")
+        else
+            list.push(out, spaces(inner) + line + "\n")
+    for _ in 1..trailing
+        list.push(out, "\n")
+    out
+
+fn width_of(style: YamlStyle) -> Int
+    match style.width
+        WidthUnlimited    => 0
+        WidthFold(n)      => n
+        WidthQuoteFold(n) => n
+
+// A plain scalar folded at single spaces so that no line passes the
+// width, where it can be; continuation lines are indented to `inner`.
+fn folded_plain(t: Str, inner: Int, used: Int, style: YamlStyle) -> Str
+    let width = width_of(style)
+    if width <= 0 or used + str.len(t) <= width
+        return t
+    let words = str.split(t, " ")
+    for w in words
+        if w == ""
+            return long_plain(t, inner, used, style)
+    var lines: [Str] = []
+    var line = words[0]
+    var at = used
+    for i in 1..list.len(words)
+        let w = words[i]
+        if at + str.len(line) + 1 + str.len(w) > width
+            list.push(lines, line)
+            line = w
+            at = inner
+        else
+            line = line + " " + w
+    list.push(lines, line)
+    if list.len(lines) == 1
+        return long_plain(t, inner, used, style)
+    str.join(lines, "\n" + spaces(inner))
+
+// A plain scalar with no single space to fold at: left long, or
+// double-quoted and broken under `WidthQuoteFold`.
+fn long_plain(t: Str, inner: Int, used: Int, style: YamlStyle) -> Str
+    match style.width
+        WidthQuoteFold(_) => quoted_fold(t, inner, used, style)
+        _                 => t
+
+// A double-quoted scalar broken with escaped line breaks so that no line
+// passes the width, under `WidthQuoteFold`.  A break is placed before a
+// character that is not a space, since the reader drops the leading
+// spaces of the line after an escaped break.
+fn quoted_fold(t: Str, inner: Int, used: Int, style: YamlStyle) -> Str
+    let q = double_quoted(t)
+    let width = match style.width
+        WidthQuoteFold(n) => n
+        _                 => 0
+    if width <= 0 or used + str.len(q) <= width
+        return q
+    var parts: [Str] = []
+    var line_len = used
+    var start = 0
+    let n = str.len(q)
+    var last_escape = -99
+    for i in 1..n - 1
+        let b = str.byte_at_or(q, i, 0)
+        if str.byte_at_or(q, i - 1, 0) == '\\'
+            last_escape = i - 1
+        // An escape is at most ten bytes, `\U` and eight digits, and a
+        // break inside one would change it.
+        if line_len + (i - start) + 1 >= width and b != ' ' and b < 0x80 and i - last_escape > 10
+                and i - start > 1
+            list.push(parts, str.slice(q, start, i) + "\\\n" + spaces(inner))
+            start = i
+            line_len = inner
+    list.push(parts, str.slice(q, start, n))
+    str.join(parts, "")
