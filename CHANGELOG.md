@@ -5,6 +5,45 @@ All notable changes to yaml-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-09-27
+
+The first implementation of the interface published as 0.0.1: YAML 1.2
+read by recursive descent over chapters 6 to 9 of the specification,
+with the safety policy applied while the tree is built, and written in
+block style.  Every case of the yaml-test-suite is read as the suite
+says, except two that bind one key twice.
+
+### Changed, breaking
+
+- `YamlError` gains `ComplexKey(line, col)`, the refusal of a mapping
+  key that is a collection under a policy that does not allow one.
+- `YamlReader`'s fields are the state the reader keeps: `line`,
+  `doc_index`, `partial`, `pending`, `in_doc`, `doc_lines`,
+  `doc_line`, `marked`, `directives`, `anchors` and `failure`.  The
+  interface's `col`, `indents`, `nodes`, `failed`, `failed_line` and
+  `failed_col` are gone; `failure` holds the refusal whole.
+- `yamlkeys.merge` answers a `YamlValue` rather than a `Result`: two
+  trees always merge.
+- `hardened()` sets `max_alias_uses` to 0, since it turns aliases off.
+
+### Behaviour the interface left open
+
+- A directive other than `%YAML` and `%TAG` is ignored, as section
+  6.8.1 says of reserved directives; `BadDirective` is a `%YAML` for a
+  version other than 1.x, a second `%YAML`, a malformed `%TAG`, or a
+  directive with no document after it.
+- An alias under a policy with aliases off is `AliasRepeatExceeded`
+  with a limit of 0.  A scalar past `max_scalar_bytes` is
+  `UnterminatedQuote` for a quoted one and `BadBlockScalar` otherwise.
+- `feed` reads the open document as far as it has arrived, so a
+  refusal in its complete lines is reported at once; an unclosed quote
+  or bracket waits for the next chunk.
+- A reader built with a negative budget refuses the first document that
+  reaches it.
+- The writer writes a string of several lines as a literal block
+  scalar when its first line with text starts with no whitespace, and
+  double-quoted otherwise; a mapping is always written in block style.
+
 ## 0.0.3 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.

@@ -2,17 +2,11 @@
 
 YAML is a human-readable data format, specified in
 [YAML 1.2.2](https://yaml.org/spec/1.2.2/). This package reads and
-writes the **safe subset** of it in novo-lang, with no dependencies:
+writes it in novo-lang, with no dependencies, as a safe loader:
 block and flow collections, the core schema's scalars, anchors and
 aliases under a budget, block scalars, multi-document streams, and a
 named refusal of every tag a safe loader must not honour. Nothing here
 opens a file, and nothing here constructs a value from a tag.
-
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
 
 ## What it is
 
@@ -48,7 +42,7 @@ program can hold different ones and neither can change the other's.
 | --- | --- | --- |
 | `max_depth` | 64 | 16 |
 | `max_nodes` | 1 000 000 | 10 000 |
-| `max_alias_uses` | 1 000 | — |
+| `max_alias_uses` | 1 000 | 0 |
 | `max_scalar_bytes` | 4 194 304 | 65 536 |
 | `allowed_tags` | none | none |
 | `allow_aliases` | true | false |
@@ -87,10 +81,7 @@ fn main() [io]
 `deploy.yaml:2:1: a tab where YAML requires a space`, which is the shape
 an editor's error list parses.
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a `not implemented:
-yaml-nv.<module>.<fn>` panic. The tests are the specification the
-implementation will have to satisfy.
+Build it with `novo pkg build` and run the suites with `novo test`.
 
 ## What the package contains
 
@@ -102,6 +93,9 @@ implementation will have to satisfy.
 | `yamlkeys` | Dotted-key access: lookups, typed reads that answer a result, optional reads for a default, and the edits over a tree. |
 | `yamlwrite` | Writing: a document or a stream, two styles, the line-width policy, and the quoting rule on its own. |
 | `yamlerror` | Every way a document is refused, each with the line and the column, and which refusals are the safety policy's. |
+
+`yamlparse`, which reads one document's text, is internal to the
+package.
 
 ## How to choose an entry point
 
@@ -156,14 +150,15 @@ nothing for an absent key, which is the shape a default wants.
    many times, which is the line to go and look at.
 5. **`hardened()` turns aliases off rather than budgeting them.** A
    hostile document's cheapest attack is the one aliases enable, and a
-   webhook body has no legitimate use for a backreference.
+   webhook body has no legitimate use for a backreference. An alias
+   under it is `AliasRepeatExceeded` with a limit of 0.
 6. **`no` is a string.** See the schema table. `SchemaLegacy11` is the
    1.1 reading, named so that a call site says what it is opting into.
 7. **The same key twice in one mapping is refused.** YAML 1.2 section
    3.2.1.1 makes keys unique. Most loaders keep the last one silently,
    which picks a winner nobody chose; `DuplicateKey` names both lines.
 8. **A complex key is refused by default.** `? [a, b]` is legal YAML
-   that almost nothing downstream can represent.
+   that almost nothing downstream can represent, and it is `ComplexKey`.
    `yamlsafe.with_complex_keys` turns it on.
 9. **A tab in indentation has its own refusal.** A tab is invisible in
    the editor that produced it, so a line and column alone would send a
@@ -193,6 +188,13 @@ nothing for an absent key, which is the shape a default wants.
     changes how a value is written to meet a formatting rule.
 17. **A `---` is always emitted between the documents of a stream**,
     whatever the style says, because without it there is no stream.
+18. **A directive other than `%YAML` and `%TAG` is ignored**, as YAML
+    1.2 section 6.8.1 says of reserved directives. A `%YAML` for a
+    version other than 1.x is `BadDirective`, and so is a directive
+    with no document after it.
+19. **A continuation line is indented past its block.** A multi-line
+    quoted scalar or flow collection inside a mapping value continues
+    on lines indented further than the mapping's keys (section 7.1).
 
 ## What is not included
 
@@ -203,6 +205,9 @@ nothing for an absent key, which is the shape a default wants.
 - **The `<<` merge key.** It is a YAML 1.1 resolution rule that
   silently rewrites a document. `yamlkeys.merge` does the same job at a
   call site where a reader can see it happen.
+- **A mapping key that is a collection, in the writer.** `yamlwrite`
+  answers `NotEmittable` for one; the reader reads one when the policy
+  allows it.
 - **`!!binary` and the other type-specific tags beyond the core
   schema.** A caller that wants one allows it by name; see rule 3.
 - **A subprocess.** Nothing here shells out. A library whose behaviour
@@ -239,20 +244,28 @@ nothing for an absent key, which is the shape a default wants.
 
 ## Tests
 
-```bash
-novo test --isolate tests/yamlread_tests.nv    # 13 tests: the grammar and the refusals
-novo test --isolate tests/yamlkeys_tests.nv    # 10 tests: dotted paths and typed reads
-novo test --isolate tests/yamlnode_tests.nv    #  9 tests: the tree and scalar resolution
-novo test --isolate tests/yamlsafe_tests.nv    #  9 tests: the policy and the budgets
-novo test --isolate tests/yamlcover_tests.nv   #  8 tests: the corners of the format
-```
+The YAML 1.2.2 specification is the reference, and the
+[yaml-test-suite](https://github.com/yaml/yaml-test-suite) corpus is
+the oracle. `tools/yaml_test_suite.sh` runs every case of the suite's
+data branch through a built program: the documents of each valid case
+are compared with the suite's `in.json`, and each invalid case must be
+refused. Of 402 cases, 373 agree with `in.json` or are refused as the
+suite marks them, 27 valid cases with no JSON form are read without
+error, and the remaining 2 bind one key twice, which this package
+refuses by design. `tools/yaml_test_suite.sh --emit` writes the cases
+that agree into `tests/yts_tests.nv`, where each valid case is also
+written by `yamlwrite` and read back to an equal tree.
 
-The YAML 1.2.2 specification is the oracle and the `yaml-test-suite`
-corpus is the vector set the implementation will be measured against.
-`libyaml` is the reference for the scanner's state machine and the
-block-context rules, `go-yaml` for the shape of the reading API, and
-PyYAML for the list of what a safe loader must refuse, which is a list
-learned the hard way.
+```bash
+novo test tests/yts_tests.nv        # 10 tests: 373 yaml-test-suite cases, and the writer's round trip
+novo test tests/yamlread_tests.nv   # 13 tests: the grammar and the refusals
+novo test tests/yamlkeys_tests.nv   # 10 tests: dotted paths and typed reads
+novo test tests/yamlnode_tests.nv   #  9 tests: the tree and scalar resolution
+novo test tests/yamlsafe_tests.nv   #  9 tests: the policy and the budgets
+novo test tests/yamlcover_tests.nv  #  8 tests: the corners of the format
+novo test tests/edges_tests.nv      # 10 tests: escapes, schemas, byte handling, the writer's policies
+bash tests/coverage.sh              # line coverage over src/
+```
 
 The suite asserts that `no` is a string under the core schema and a
 boolean under the 1.1 one, that a language-specific tag is refused with
@@ -261,24 +274,6 @@ each of the three budgets refuses the document that exceeds it and
 names what it counted, that a duplicate key is refused with both lines,
 that a tab in indentation has its own refusal, that an alias cannot
 reach past a `---`, and that a chunk may split a document anywhere.
-
-The tests compile today and fail at run, each on the `not implemented`
-panic that is its body. That is the expected state of an interface
-release. They turn green one at a time as bodies land.
-
-## Implementation status
-
-Nothing is implemented. Every function here is declared with its
-signature and its effect row, and every body is a `todo()`.
-
-| Module | Public types | Functions | Implemented |
-| --- | --- | --- | --- |
-| `yamlnode` | `YamlValue`, `YamlPair`, `YamlKind`, `YamlSchema` | 9 | no |
-| `yamlerror` | `YamlError`, with `impl Error` | 4 | no |
-| `yamlsafe` | `YamlLimits` | 11 | no |
-| `yamlread` | `YamlReader` | 11 | no |
-| `yamlkeys` | — | 24 | no |
-| `yamlwrite` | `YamlStyle`, `YamlWidth` | 10 | no |
 
 ## Licence
 
