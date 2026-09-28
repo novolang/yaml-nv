@@ -21,7 +21,7 @@ no answer changed.
   `yamlsafe` and `yamlwrite` now import the enum by name, `use
   yamlerror.{ YamlError }`.
 - The change was checked with a suite that declares an enum repeating
-  every variant name of the package's enums: before it, 71 constructor
+  every variant name of the package's enums: before it, 61 constructor
   sites were refused, and after it none.  That suite is not shipped,
   for the reason toml-nv 0.1.1 gives: under `novo test`, such an enum
   makes the package's values leak when they are dropped, which is a
