@@ -23,6 +23,7 @@
 // per-anchor bound names the anchor doing the damage.
 
 use std.list
+use yamlerror.{ YamlError }
 use yamlnode
 
 // What this loader will and will not do with a document.

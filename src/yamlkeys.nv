@@ -20,6 +20,7 @@
 
 use std.str
 use std.list
+use yamlerror.{ YamlError }
 use yamlnode
 
 // The node at a path, or why not.

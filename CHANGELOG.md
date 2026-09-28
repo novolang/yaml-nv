@@ -5,6 +5,28 @@ All notable changes to yaml-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.1 — 2026-09-28
+
+The package builds beside a program, or another package, that declares
+a variant with the same name as one of `YamlError`'s.  No signature and
+no answer changed.
+
+- Four modules built `YamlError` values with bare constructors such as
+  `NoSuchKey(...)` without importing the enum.  A bare constructor that
+  its own file neither declares nor imports is resolved across the whole
+  build (SPEC § 9.4).  A build that also held toml-nv, whose `TomlError`
+  declares `NoSuchKey`, `BadEscape`, `DuplicateKey`, `TooDeep` and
+  `UnexpectedByte`, was then refused with E2031 inside yaml-nv's
+  source; config-nv is such a build.  `yamlkeys`, `yamlparse`,
+  `yamlsafe` and `yamlwrite` now import the enum by name, `use
+  yamlerror.{ YamlError }`.
+- The change was checked with a suite that declares an enum repeating
+  every variant name of the package's enums: before it, 71 constructor
+  sites were refused, and after it none.  That suite is not shipped,
+  for the reason toml-nv 0.1.1 gives: under `novo test`, such an enum
+  makes the package's values leak when they are dropped, which is a
+  toolchain defect.
+
 ## 0.1.0 — 2026-09-28
 
 The first implementation of the interface published as 0.0.1: YAML 1.2
