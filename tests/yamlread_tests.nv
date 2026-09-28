@@ -242,6 +242,27 @@ fn test_read_all_is_charged_what_the_stream_costs_and_not_more() [io]
         Err(_)   => test.fail("two documents separated by `---`")
     src.drop()
 
+    test.case("a flow sequence the stream never closes is refused at its end")
+    let open = Buffer.from_str("a: [1, 2\n")
+    match yamlread.read_all(open, yamlsafe.standard())
+        Ok(_)  => test.fail("`[` without its `]` is not a document")
+        Err(e) => test.assert_eq(yamlerror.line_of(e), 1)
+    open.drop()
+
+    test.case("the stream's own failure is carried through as Transport")
+    match yamlread.read_all(Failing { code: 0 }, yamlsafe.standard())
+        Err(Transport(cause)) => test.assert(cause == IoNotFound)
+        Err(_)                => test.fail("the source failed, not the document")
+        Ok(_)                 => test.fail("a source that fails has no documents")
+
+// A source whose stream fails on every call.
+struct Failing
+    code: Int
+
+impl Read[] for Failing
+    fn read(self, n: Int) -> Result<Bytes, IoError> []
+        Err(IoNotFound)
+
 @test
 fn test_check_is_parse_stream_with_the_ok_arm_dropped() [io]
     test.case("a valid stream has no refusal")
