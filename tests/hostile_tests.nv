@@ -1,0 +1,35 @@
+// hostile_tests.nv — nesting, aliases and long lines a few kilobytes
+// long.
+
+use std.test
+use yamlread
+use yamlsafe
+
+fn refused(r: Result<YamlValue, YamlError>) -> Bool []
+    match r
+        Err(_) => true
+        Ok(_)  => false
+
+@test
+fn test_deep_nesting_is_refused_not_recursed_into() [io]
+    let p = yamlsafe.standard()
+    test.case("flow sequences")
+    test.assert(refused(yamlread.parse("[".repeat(300000) + "]".repeat(300000), p)))
+    test.case("flow mappings")
+    test.assert(refused(yamlread.parse("{a: ".repeat(100000) + "1" + "}".repeat(100000), p)))
+    test.case("block sequences")
+    var text = ""
+    for i in 0..3000
+        text = text + " ".repeat(i) + "-\n"
+    test.assert(refused(yamlread.parse(text, p)))
+    test.case("a block mapping that nests by indentation")
+    var m = ""
+    for i in 0..3000
+        m = m + " ".repeat(i) + "a:\n"
+    test.assert(refused(yamlread.parse(m, p)))
+
+@test
+fn test_an_alias_bomb_is_refused() [io]
+    let p = yamlsafe.standard()
+    let bomb = "a: &a [x, x, x, x, x, x, x, x, x]\nb: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a]\nc: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b]\nd: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c]\ne: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d]\nf: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e]\ng: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f]\nh: &h [*g, *g, *g, *g, *g, *g, *g, *g, *g]\n"
+    test.assert(refused(yamlread.parse(bomb, p)))
